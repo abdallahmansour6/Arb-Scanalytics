@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Project artifacts
+data/
+*.duckdb
+*.duckdb.wal
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+.ipynb_checkpoints/
+
+# Claude Code (runtime state, local-only settings)
+.claude/
+
+# Secrets
+.env
+.streamlit/secrets.toml

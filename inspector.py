@@ -1,0 +1,147 @@
+"""
+Sanity probes against the persisted Parquet partitions.
+
+Usage:
+    python inspect.py                # run all sections
+    python inspect.py overview       # row counts + coverage per venue
+    python inspect.py btc            # BTC/USDT:USDT row across venues
+    python inspect.py spreads        # top cross-venue funding spreads
+    python inspect.py anomalies      # top |APY| anomalies (vol-gated)
+
+Caveat (per FIELD_NOTES.md): "latest snapshot per (exchange, symbol)" via
+window function returns the most recent row even if that row is stale —
+when a venue intermittently drops a pair from its batch response, the
+prior value persists in this view. Use the *_overview_ts_utc column to
+spot freshness gaps.
+"""
+
+import sys
+
+import duckdb
+
+from config import FUNDING_DIR
+
+
+_GLOB = str(FUNDING_DIR / "**" / "*.parquet").replace("\\", "/")
+
+
+def _open():
+    db = duckdb.connect()
+    db.sql(f"""create or replace view f as
+               select * from read_parquet('{_GLOB}', hive_partitioning=true)""")
+    return db
+
+
+def _print_df(df):
+    print(df.to_string(index=False))
+
+
+def overview():
+    db = _open()
+    print("\n=== overview ===")
+    row = db.sql("""select count(*) as rows,
+                           count(distinct exchange) as venues,
+                           count(distinct symbol_canonical) as symbols,
+                           count(distinct ts_utc) as ts_cycles,
+                           epoch_ms(min(ts_utc)) as first_ts,
+                           epoch_ms(max(ts_utc)) as last_ts
+                    from f""").df()
+    _print_df(row)
+    print("\nper-venue:")
+    _print_df(db.sql("""
+        select exchange,
+               count(distinct ts_utc) as cycles,
+               count(*) as rows,
+               count(predicted_rate) as has_pred,
+               count(open_interest_usd) as has_oi,
+               count(volume_24h_usd) as has_vol,
+               count(next_funding_ts) as has_next_ts,
+               max(epoch_ms(ts_utc)) as last_seen
+        from f group by 1 order by 1
+    """).df())
+
+
+def btc():
+    db = _open()
+    print("\n=== BTC/USDT:USDT across venues (latest per venue) ===")
+    _print_df(db.sql("""
+        select exchange,
+               round(funding_rate, 6) as rate,
+               funding_interval_h as h,
+               round(coalesce(predicted_rate, funding_rate), 6) as predicted,
+               round(apy_norm * 100, 2) as apy_pct,
+               round(mark_price, 2) as mark,
+               round(open_interest_usd / 1e6, 1) as oi_musd,
+               round(volume_24h_usd / 1e6, 1) as vol_musd,
+               epoch_ms(ts_utc) as ts
+        from f where symbol_canonical = 'BTC/USDT:USDT'
+        qualify row_number() over (partition by exchange order by ts_utc desc) = 1
+        order by exchange
+    """).df())
+
+
+def spreads(limit: int = 20):
+    db = _open()
+    print(f"\n=== top {limit} cross-venue funding spreads (latest, both legs >= $1M vol) ===")
+    _print_df(db.sql(f"""
+        with latest as (
+            select * from f
+            qualify row_number() over (partition by exchange, symbol_canonical
+                                       order by ts_utc desc) = 1
+        )
+        select symbol_canonical,
+               count(*) as n_venues,
+               arg_max(exchange, apy_norm)  as venue_high,
+               arg_min(exchange, apy_norm)  as venue_low,
+               round(max(apy_norm)*100, 1)  as apy_high_pct,
+               round(min(apy_norm)*100, 1)  as apy_low_pct,
+               round((max(apy_norm) - min(apy_norm)) * 100, 1) as delta_apy_pct,
+               round(min(volume_24h_usd)/1e6, 1) as min_vol_musd
+        from latest
+        group by 1
+        having count(*) >= 2 and min(volume_24h_usd) >= 1e6
+        order by delta_apy_pct desc
+        limit {limit}
+    """).df())
+
+
+def anomalies(limit: int = 20):
+    db = _open()
+    print(f"\n=== top {limit} |APY| anomalies (latest, vol >= $5M) ===")
+    _print_df(db.sql(f"""
+        with latest as (
+            select * from f
+            qualify row_number() over (partition by exchange, symbol_canonical
+                                       order by ts_utc desc) = 1
+        )
+        select exchange,
+               symbol_canonical,
+               round(funding_rate, 6) as rate,
+               funding_interval_h as h,
+               round(apy_norm * 100, 1) as apy_pct,
+               round(volume_24h_usd / 1e6, 1) as vol_musd,
+               round(open_interest_usd / 1e6, 1) as oi_musd
+        from latest
+        where volume_24h_usd >= 5e6
+        order by abs(apy_norm) desc
+        limit {limit}
+    """).df())
+
+
+MODES = {"overview": overview, "btc": btc, "spreads": spreads, "anomalies": anomalies}
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if cmd == "all":
+        overview(); btc(); spreads(); anomalies()
+        return
+    fn = MODES.get(cmd)
+    if not fn:
+        print(__doc__)
+        sys.exit(2)
+    fn()
+
+
+if __name__ == "__main__":
+    main()
