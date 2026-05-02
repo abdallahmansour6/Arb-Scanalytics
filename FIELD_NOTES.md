@@ -456,3 +456,74 @@ they start automatically once `network-online.target` is reached.
 The cron file in `/etc/cron.d/` is loaded by cron at startup, no
 intervention needed. Compaction picks up wherever it left off
 (idempotent). Liveness ping resumes its 5-min cadence.
+
+---
+
+## Sync workflow — local laptop → GitHub → VPS
+
+Repo: `github.com/abdallahmansour6/Arb-Scanalytics` (private). `origin`
+remote is set on both the laptop and the VPS clone. `.gitattributes`
+forces LF on commit so Windows checkouts don't ship CRLF to the VPS.
+
+### Standard cycle
+
+```bash
+# 1. Edit on laptop. Commit + push:
+git add -A
+git commit -m "what you changed and why"
+git push origin main
+
+# 2. On the VPS:
+cd /opt/Arb-Scanalytics
+git pull origin main
+
+# 3. Depending on WHAT changed, restart accordingly:
+```
+
+### What needs a restart after `git pull`
+
+| File(s) changed                      | Action on VPS                                                                                          |
+|--------------------------------------|--------------------------------------------------------------------------------------------------------|
+| `collector.py`, `config.py`          | `systemctl restart arb-collector`                                                                      |
+| `dashboard.py`                       | `systemctl restart arb-dashboard` (then refresh the browser tab)                                       |
+| `compact.py`, `liveness_ping.sh`     | Nothing. Cron picks up the new file on its next invocation.                                            |
+| `requirements.txt`                   | `.venv/bin/pip install -r requirements.txt` then restart whichever services use the new dep.           |
+| `deploy/arb-collector.service`       | `install -m 644 deploy/arb-collector.service /etc/systemd/system/ && systemctl daemon-reload && systemctl restart arb-collector` |
+| `deploy/arb-dashboard.service`       | same pattern, dashboard.                                                                               |
+| `deploy/arb-cron`                    | `install -m 644 deploy/arb-cron /etc/cron.d/arb-scanalytics`. cron auto-reloads.                       |
+| `.env.example`                       | Reference only. If new keys are needed, add them to `/opt/Arb-Scanalytics/.env` manually.              |
+
+`.env` itself is gitignored — it lives only on the VPS and never gets
+pushed/pulled. Keys go in there once per host.
+
+### Schema and `data/` rules of thumb
+
+`data/` is gitignored (parquet files never leave the VPS via git). The
+collector's PyArrow schema is the contract. Additive changes (new
+columns) merge cleanly with `read_parquet(union_by_name=true)`. Renames
+or type changes break this — wipe `data/` if you ever need one. The
+compaction script is schema-tolerant via `concat_tables(promote_options=
+"default")`, so a mid-day schema bump is fine.
+
+### Rollback
+
+```bash
+# On VPS, jump back to a known-good commit:
+cd /opt/Arb-Scanalytics
+git log --oneline -10                # find the SHA you want
+git checkout <sha>                   # detached HEAD at that revision
+systemctl restart arb-collector arb-dashboard
+
+# To return to the latest:
+git checkout main
+git pull origin main
+systemctl restart arb-collector arb-dashboard
+```
+
+### CRLF / line endings
+
+`.gitattributes` forces LF on commit for `.sh`, `.py`, `.service`, `.md`,
+etc. so the VPS always gets Unix line endings. If you bypass this
+(e.g., paste CRLF content directly into a file on the VPS), shell
+scripts and shell-sourced `.env` files will fail with `$'\r': command
+not found`. The fix: re-pull from GitHub or run `dos2unix <file>`.
