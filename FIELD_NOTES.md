@@ -14,9 +14,7 @@ polling at ~60 s cadence.
 ## Project venues (13)
 
 `BINANCE`, `BINGX`, `BITGET`, `BITMART`, `BYBIT`, `COINEX`, `GATE.IO`,
-`HTX`, `KUCOIN`, `MEXC`, `OKX`, `PHEMEX`, `XT.COM`. BLOFIN was scoped
-out — its API sits behind a Cloudflare anti-VPN/anti-bot challenge that
-403s NordVPN-Singapore traffic.
+`HTX`, `KUCOIN`, `MEXC`, `OKX`, `PHEMEX`, `XT.COM`.
 
 ---
 
