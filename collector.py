@@ -28,6 +28,7 @@ import asyncio
 import logging
 import signal
 import time
+from collections import Counter
 from contextlib import suppress
 from datetime import datetime, timezone
 
@@ -35,7 +36,8 @@ import aiohttp
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from config import VENUES, FUNDING_DIR, POLL_INTERVAL_S, open_client
+from config import (VENUES, FUNDING_DIR, POLL_INTERVAL_S,
+                    MARKETS_RELOAD_INTERVAL_S, open_client)
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +187,29 @@ def _write_partition(exchange: str, ts_ms: int, rows: list[dict]):
 # Per-venue collectors. Each function owns its venue's full extraction:
 # what to fetch, where to read each field, what the unit conversion is.
 # Single source per field. NULL where the source is unavailable.
+#
+# Fan-out venues (BINANCE, BINGX, XT.COM) make hundreds of per-symbol
+# calls per cycle; per-call failures used to be silently swallowed,
+# which masked rate-limit incidents and gradual data degradation. Each
+# fan-out now counts failures by exception type and emits a structured
+# WARNING when any cycle has non-zero failures, so the symptoms surface
+# the moment they appear.
 # ---------------------------------------------------------------------------
+
+
+def _log_fanout(exchange: str, op: str, attempted: int,
+                failures: "Counter[str]") -> None:
+    """Emit a single-line structured warning if a cycle's fan-out had
+    failures. Silent when everything succeeded. Failure count is
+    broken down by exception type so rate-limit pressure is
+    distinguishable from network blips or venue-side outages."""
+    if not failures:
+        return
+    total = sum(failures.values())
+    breakdown = ", ".join(f"{etype}={n}"
+                          for etype, n in failures.most_common())
+    log.warning("[%s] %s fan-out: %d/%d failed (%s)",
+                exchange, op, total, attempted, breakdown)
 
 # -- BINANCE -----------------------------------------------------------------
 
@@ -238,12 +262,14 @@ async def collect_binance(c, ts_ms):
         fanout.append((sym, market, row))
 
     sem = asyncio.Semaphore(40)  # public /openInterest weight=1, 2400/min
+    failures: Counter[str] = Counter()
 
     async def _one(sym, market, row):
         async with sem:
             try:
                 oi = await c.fetch_open_interest(sym)
-            except Exception:
+            except Exception as e:
+                failures[type(e).__name__] += 1
                 return
             amt = _f(oi.get("openInterestAmount"))
             if amt is None or row["mark_price"] is None:
@@ -252,6 +278,7 @@ async def collect_binance(c, ts_ms):
             row["open_interest_usd"] = amt * cs * row["mark_price"]
 
     await asyncio.gather(*(_one(s, m, r) for s, m, r in fanout))
+    _log_fanout("BINANCE", "OI", len(fanout), failures)
     return rows
 
 
@@ -295,16 +322,19 @@ async def collect_bingx(c, ts_ms):
         fanout.append((sym, row))
 
     sem = asyncio.Semaphore(40)
+    failures: Counter[str] = Counter()
 
     async def _one(sym, row):
         async with sem:
             try:
                 oi = await c.fetch_open_interest(sym)
-            except Exception:
+            except Exception as e:
+                failures[type(e).__name__] += 1
                 return
             row["open_interest_usd"] = _f(oi.get("openInterestValue"))
 
     await asyncio.gather(*(_one(s, r) for s, r in fanout))
+    _log_fanout("BINGX", "OI", len(fanout), failures)
     return rows
 
 
@@ -784,12 +814,14 @@ async def collect_xt(c, ts_ms):
                if (m := c.markets.get(s)) and _is_usdt_linear(m)]
 
     sem = asyncio.Semaphore(40)
+    failures: Counter[str] = Counter()
 
     async def _one(sym, market, t):
         async with sem:
             try:
                 f = await c.fetch_funding_rate(sym)
-            except Exception:
+            except Exception as e:
+                failures[type(e).__name__] += 1
                 return None
         f_info = f.get("info") or {}
         info = t.get("info") or {}
@@ -807,6 +839,7 @@ async def collect_xt(c, ts_ms):
         )
 
     results = await asyncio.gather(*(_one(s, m, t) for s, m, t in targets))
+    _log_fanout("XT.COM", "funding", len(targets), failures)
     return [r for r in results if r is not None]
 
 
@@ -857,8 +890,30 @@ async def venue_loop(canonical: str, stop: asyncio.Event, max_cycles: int = -1):
                       canonical, type(e).__name__, str(e)[:200])
             return
         log.info("[%s] markets loaded (%d total)", canonical, len(c.markets))
+        last_reload = time.monotonic()
         while not stop.is_set():
             cycle_start = time.monotonic()
+
+            # Periodic market-metadata refresh — picks up newly-listed (or
+            # removed) symbols on the venue without restarting the loop.
+            # Per-venue extractors read intervals/contract sizes from
+            # market.info, so a fresh load_markets is the only thing
+            # required for new pairs to flow through correctly. On
+            # reload failure we keep the previous cache and try again
+            # one full interval later (no aggressive retry — protects
+            # against cascading load on a degraded venue).
+            if cycle_start - last_reload >= MARKETS_RELOAD_INTERVAL_S:
+                prev_count = len(c.markets)
+                try:
+                    await c.load_markets(reload=True)
+                    new_count = len(c.markets)
+                    log.info("[%s] markets reloaded: %d total (%+d)",
+                             canonical, new_count, new_count - prev_count)
+                except Exception as e:
+                    log.warning("[%s] markets reload failed: %s: %s",
+                                canonical, type(e).__name__, str(e)[:200])
+                last_reload = cycle_start
+
             ts_ms = int(time.time() * 1000)
             try:
                 rows = await collector(c, ts_ms)

@@ -13,6 +13,13 @@ FUNDING_DIR = DATA_DIR / "funding"
 POLL_INTERVAL_S = 30
 CCXT_TIMEOUT_MS = 30_000  # NordVPN egress adds latency; default 10s is tight.
 
+# How often each venue loop refreshes its market metadata via
+# c.load_markets(reload=True). Picks up newly-listed (or removed) pairs
+# without requiring a full collector restart. The cost per reload is one
+# light HTTP call per venue; 15 min keeps it negligible while bounding
+# new-listing latency for hot pairs.
+MARKETS_RELOAD_INTERVAL_S = 900
+
 # Canonical venue slug -> CCXT class id.
 # Locked at the collector boundary; downstream layers only see the slug.
 # Class-id quirks documented in FIELD_NOTES.md ("Venue -> CCXT mapping").

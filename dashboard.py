@@ -296,7 +296,10 @@ def render_anomalies():
         "vol_max_usd": st.session_state.get("anom_vol_max", 1e9) * 1e6,
         "settles_max": st.session_state.get("anom_settles_max", 0),
     }
-    df = _apply_filters(snapshot, f).copy()
+    # Drop rows without a usable apy_norm — this view ranks by APY, so a
+    # row whose APY is NaN (because the venue couldn't supply funding_rate
+    # or interval_h for that symbol this cycle) has nothing to contribute.
+    df = _apply_filters(snapshot, f).dropna(subset=["apy_norm"]).copy()
     df["apy_pct"] = df["apy_norm"] * 100
     df["vol_musd"] = df["volume_24h_usd"] / 1e6
     df["oi_musd"] = df["open_interest_usd"] / 1e6
@@ -329,7 +332,11 @@ def render_spreads():
         "settles_max": st.session_state.get("spread_settles_max", 0),
     }
     min_venues = st.session_state.get("spread_min_venues", 2)
-    base = _apply_filters(snapshot, f)
+    # Spreads is an APY-ranking view; drop rows whose apy_norm is NaN (the
+    # venue couldn't supply funding_rate or interval_h this cycle). They
+    # cannot be high or low APY by definition, and including them poisons
+    # idxmax/idxmin when a symbol's only matching venues are all-NaN.
+    base = _apply_filters(snapshot, f).dropna(subset=["apy_norm"])
 
     if base.empty:
         st.info("No symbols match filters.")
