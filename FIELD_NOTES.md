@@ -401,9 +401,10 @@ outage triggers immediately.
 # Manually run the liveness check (silent on success)
 /opt/Arb-Scanalytics/liveness_ping.sh
 
-# Force-test the alert path with a fake stale dir
-DATA_DIR=/tmp/empty mkdir -p /tmp/empty && \
-    DATA_DIR=/tmp/empty ALERT_STATE=/tmp/test-alert /opt/Arb-Scanalytics/liveness_ping.sh
+# Force-test the alert path with a fake stale dir (sends a real Pushover ping)
+mkdir -p /tmp/empty
+DATA_DIR=/tmp/empty ALERT_STATE=/tmp/test-alert \
+    /opt/Arb-Scanalytics/liveness_ping.sh
 
 # View liveness log (only logs on alerts)
 tail -100 /var/log/arb-liveness.log
@@ -427,27 +428,6 @@ ps -eo pid,user,%mem,rss,cmd --sort=-rss | head -10
 `vm.swappiness=10` (set in `/etc/sysctl.d/99-arb-swappiness.conf`) keeps
 the kernel preferring RAM and only swaps under real pressure. The
 swap file persists across reboots via `/etc/fstab`.
-
-### Updating the unit files / cron / scripts
-
-Local source of truth lives in the project: `compact.py`, `deploy/*.service`,
-`deploy/liveness_ping.sh`, `deploy/arb-cron`. To redeploy:
-
-```bash
-# From local laptop:
-scp compact.py deploy/* root@<vps>:/tmp/
-
-# On the VPS:
-install -m 644 /tmp/compact.py /opt/Arb-Scanalytics/compact.py
-install -m 755 /tmp/liveness_ping.sh /opt/Arb-Scanalytics/liveness_ping.sh
-install -m 644 /tmp/arb-collector.service /etc/systemd/system/
-install -m 644 /tmp/arb-dashboard.service /etc/systemd/system/
-install -m 644 /tmp/arb-cron /etc/cron.d/arb-scanalytics
-systemctl daemon-reload
-systemctl restart arb-collector arb-dashboard
-```
-
-cron picks up `/etc/cron.d/` changes automatically, no reload needed.
 
 ### Boot recovery
 
@@ -527,3 +507,50 @@ etc. so the VPS always gets Unix line endings. If you bypass this
 (e.g., paste CRLF content directly into a file on the VPS), shell
 scripts and shell-sourced `.env` files will fail with `$'\r': command
 not found`. The fix: re-pull from GitHub or run `dos2unix <file>`.
+
+### First-time bootstrap on a fresh VPS
+
+Use this for a brand-new droplet or a rebuild. Assumes Ubuntu 24.04+
+with Python 3.12 and an SSH key that GitHub trusts.
+
+```bash
+# 1. Clone (read-only deploy key recommended for prod; or HTTPS + PAT)
+cd /opt
+git clone https://github.com/abdallahmansour6/Arb-Scanalytics.git
+cd Arb-Scanalytics
+
+# 2. Python venv + dependencies
+python3 -m venv .venv
+.venv/bin/pip install -U pip
+.venv/bin/pip install -r requirements.txt
+
+# 3. Scanner secrets — copy template, fill in real Pushover keys
+cp .env.example .env
+chmod 600 .env
+nano .env   # set PUSHOVER_TOKEN and PUSHOVER_USER
+
+# 4. Swap (memory safety net)
+fallocate -l 1G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+echo 'vm.swappiness=10' > /etc/sysctl.d/99-arb-swappiness.conf
+sysctl -p /etc/sysctl.d/99-arb-swappiness.conf
+
+# 5. Install systemd units + cron
+install -m 644 deploy/arb-collector.service /etc/systemd/system/
+install -m 644 deploy/arb-dashboard.service /etc/systemd/system/
+install -m 644 deploy/arb-cron /etc/cron.d/arb-scanalytics
+chmod +x liveness_ping.sh
+systemctl daemon-reload
+systemctl enable --now arb-collector arb-dashboard
+
+# 6. Verify
+systemctl status arb-collector arb-dashboard
+curl -sS http://localhost:8501/_stcore/health
+./liveness_ping.sh && echo OK
+```
+
+After this, the standard `git pull` cycle (above) works for all
+subsequent updates.
