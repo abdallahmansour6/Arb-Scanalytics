@@ -1,0 +1,15 @@
+# Force LF line endings on commit for files that run on the Linux VPS.
+# Prevents Windows checkouts from saving CRLF and propagating "$'\r':
+# command not found" errors to deployed bash scripts and shell-sourced
+# .env files.
+*.sh        text eol=lf
+*.py        text eol=lf
+*.service   text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.toml      text eol=lf
+*.ini       text eol=lf
+.gitignore  text eol=lf
+.env.example text eol=lf
+arb-cron    text eol=lf
+requirements.txt text eol=lf

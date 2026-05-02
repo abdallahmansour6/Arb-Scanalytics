@@ -1,0 +1,12 @@
+# Arb-Scanalytics cron jobs. Installed at /etc/cron.d/arb-scanalytics.
+# Format: m h dom mon dow user command
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Daily compaction at 00:30 UTC — combine yesterday's per-cycle parquet
+# files into one file per venue. Keeps disk usage flat across the year.
+30 0 * * * root cd /opt/Arb-Scanalytics && /opt/Arb-Scanalytics/.venv/bin/python compact.py >> /var/log/arb-compact.log 2>&1
+
+# Liveness check every 5 minutes. Pings Pushover if no parquet has been
+# written in the last 5 minutes (cooldown 60 min between pings).
+*/5 * * * * root /opt/Arb-Scanalytics/liveness_ping.sh >> /var/log/arb-liveness.log 2>&1

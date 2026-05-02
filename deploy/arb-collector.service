@@ -1,0 +1,23 @@
+[Unit]
+Description=Arb Scanalytics — REST funding/OI/volume collector (13 venues)
+After=network-online.target
+Wants=network-online.target
+# Don't have systemd start-rate-limit kick in during a venue outage cascade.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/Arb-Scanalytics
+ExecStart=/opt/Arb-Scanalytics/.venv/bin/python collector.py
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+# Disable systemd's per-message log rate limit (collector is chatty by design)
+LogRateLimitIntervalSec=0
+LogRateLimitBurst=0
+
+[Install]
+WantedBy=multi-user.target

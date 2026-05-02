@@ -7,7 +7,7 @@ spec is the table below; the collector implements it 1:1 in
 `collector.py`.
 
 Scope: USDT-quoted, USDT-settled, linear, swap markets only. REST
-polling at ~60 s cadence.
+polling at 30 s cadence.
 
 ---
 
@@ -285,3 +285,174 @@ the VPS — they should drop well under budget there. If not, raise
   latest cycle" — if a venue intermittently drops a pair from its
   batch response, a `qualify rn=1` query continues to return the
   prior value. Worth distinguishing in queries that need "right now".
+
+---
+
+## Deployment — VPS topology
+
+Production lives on the Singapore DigitalOcean droplet (2 vCPU /
+4 GB / 50 GB) at `/opt/Arb-Scanalytics/`. Two systemd services and
+two cron jobs comprise the runtime.
+
+| Component               | Path / unit                                       | Role                                                                  |
+|-------------------------|---------------------------------------------------|-----------------------------------------------------------------------|
+| `arb-collector.service` | `/etc/systemd/system/arb-collector.service`       | Long-running async collector, 13 venues, 30 s cadence, writes parquet |
+| `arb-dashboard.service` | `/etc/systemd/system/arb-dashboard.service`       | Streamlit on `0.0.0.0:8501`                                           |
+| Daily compaction        | `/opt/Arb-Scanalytics/compact.py` + cron 00:30 UTC| Merges yesterday's per-cycle files into one file per venue            |
+| Liveness ping           | `/opt/Arb-Scanalytics/liveness_ping.sh` + cron */5 | Pushover alert if no parquet write in last 5 min (60 min cooldown)    |
+| Swap                    | `/swapfile` (1 GB), `vm.swappiness=10`            | Memory safety net                                                     |
+
+Services are `enabled` for boot. Pushover credentials live in the
+scanner's own `.env` at `/opt/Arb-Scanalytics/.env` (gitignored,
+copied from `.env.example`). Independent of any other project — if
+you ever rename or relocate the engine, the scanner is unaffected.
+The script reads them via grep extraction (line-ending-tolerant for
+CRLF .env files).
+
+---
+
+## Day-to-day ops — commands you'll actually use
+
+### Status / logs
+
+```bash
+# Are both services healthy right now?
+systemctl status arb-collector arb-dashboard
+
+# Live tail of collector logs (Ctrl-C to exit)
+journalctl -u arb-collector -f
+
+# Last hour of dashboard logs
+journalctl -u arb-dashboard --since "1 hour ago"
+
+# Anything failed recently?
+systemctl list-units --state=failed
+```
+
+### Restart after a code or config change
+
+```bash
+# Pulled new code → restart the service
+systemctl restart arb-collector
+systemctl restart arb-dashboard   # then refresh the browser tab
+
+# Both at once
+systemctl restart arb-collector arb-dashboard
+```
+
+The current cycle is interrupted on restart. No half-written parquet
+files exist — the collector writes one file per venue per cycle
+atomically at the end of the cycle, so an interrupted cycle just
+means that one cycle's writes are skipped. Schema changes that are
+**additive** (new columns) are fine; older parquet files merge
+cleanly with `read_parquet(..., union_by_name=true)`. Renames or
+type changes break this — wipe `data/` if you ever need one.
+
+### Manual stop / start
+
+```bash
+systemctl stop arb-collector       # intentional stop, no auto-restart
+systemctl start arb-collector
+
+systemctl disable arb-collector    # stop running on boot
+systemctl enable arb-collector
+```
+
+`Restart=on-failure` only triggers for non-zero exit codes (crashes).
+A clean `systemctl stop` does not auto-restart.
+
+### Disk / data
+
+Compaction runs at 00:30 UTC daily and reduces disk usage ~6× by
+merging per-cycle files into per-venue daily files (named
+`<VENUE>_daily.parquet` inside the day partition). Same rows, same
+columns, same query semantics — pure storage optimization.
+
+```bash
+# Disk usage
+df -h /
+du -sh /opt/Arb-Scanalytics/data
+
+# Dry-run compaction (shows what would happen, doesn't change anything)
+cd /opt/Arb-Scanalytics
+.venv/bin/python compact.py --day 2026-05-01 --dry-run
+
+# Run compaction manually for a specific day (UTC date)
+.venv/bin/python compact.py --day 2026-05-01
+
+# Look at compaction log history
+tail -200 /var/log/arb-compact.log
+```
+
+Compaction is **idempotent** — re-running on a day that's already
+compacted is a no-op. **Atomic per venue** — writes a `.tmp` file,
+validates row count, atomic rename, then deletes sources. A crash
+mid-run leaves source files intact for retry.
+
+### Liveness alerts
+
+A cron job (every 5 min) checks if any parquet file was written in the
+last 5 minutes. If not, it sends a Pushover alert. Cooldown: 60 min
+between alerts during an extended outage to prevent spam. When fresh
+data appears again, the cooldown state is auto-cleared so the next
+outage triggers immediately.
+
+```bash
+# Manually run the liveness check (silent on success)
+/opt/Arb-Scanalytics/liveness_ping.sh
+
+# Force-test the alert path with a fake stale dir
+DATA_DIR=/tmp/empty mkdir -p /tmp/empty && \
+    DATA_DIR=/tmp/empty ALERT_STATE=/tmp/test-alert /opt/Arb-Scanalytics/liveness_ping.sh
+
+# View liveness log (only logs on alerts)
+tail -100 /var/log/arb-liveness.log
+
+# Reset cooldown (force the next stale-check to alert immediately)
+rm -f /tmp/arb-collector-alerted
+```
+
+### Swap
+
+```bash
+# Current usage
+swapon --show
+free -h
+
+# If swap is heavily used (> 200 MB) the box is under memory pressure —
+# investigate before OOM. Check top processes by RSS:
+ps -eo pid,user,%mem,rss,cmd --sort=-rss | head -10
+```
+
+`vm.swappiness=10` (set in `/etc/sysctl.d/99-arb-swappiness.conf`) keeps
+the kernel preferring RAM and only swaps under real pressure. The
+swap file persists across reboots via `/etc/fstab`.
+
+### Updating the unit files / cron / scripts
+
+Local source of truth lives in the project: `compact.py`, `deploy/*.service`,
+`deploy/liveness_ping.sh`, `deploy/arb-cron`. To redeploy:
+
+```bash
+# From local laptop:
+scp compact.py deploy/* root@<vps>:/tmp/
+
+# On the VPS:
+install -m 644 /tmp/compact.py /opt/Arb-Scanalytics/compact.py
+install -m 755 /tmp/liveness_ping.sh /opt/Arb-Scanalytics/liveness_ping.sh
+install -m 644 /tmp/arb-collector.service /etc/systemd/system/
+install -m 644 /tmp/arb-dashboard.service /etc/systemd/system/
+install -m 644 /tmp/arb-cron /etc/cron.d/arb-scanalytics
+systemctl daemon-reload
+systemctl restart arb-collector arb-dashboard
+```
+
+cron picks up `/etc/cron.d/` changes automatically, no reload needed.
+
+### Boot recovery
+
+Both services are `enabled` for `multi-user.target`. After a reboot
+they start automatically once `network-online.target` is reached.
+The cron file in `/etc/cron.d/` is loaded by cron at startup, no
+intervention needed. Compaction picks up wherever it left off
+(idempotent). Liveness ping resumes its 5-min cadence.
