@@ -85,9 +85,12 @@ def btc():
 def spreads(limit: int = 20):
     db = _open()
     print(f"\n=== top {limit} cross-venue funding spreads (latest, both legs >= $1M vol) ===")
-    # Per-leg refactor: short_* and long_* values come from the exact two
-    # venues with the highest / lowest APY for each symbol — NOT from
-    # min/max aggregations across the symbol's other venues.
+    # Per-leg + cross-multiplier refactor: short_* / long_* values come
+    # from the exact two (venue, canonical) rows with the highest /
+    # lowest APY for each base_coin. Grouping by base_coin (instead of
+    # symbol_canonical) collapses '1000CHEEMS' / '1MCHEEMS' / '1000000CHEEMS'
+    # / 'CHEEMS' onto the same logical token. Each leg row keeps its
+    # actual venue-specific symbol so trades can be routed correctly.
     _print_df(db.sql(f"""
         with latest as (
             select * from f
@@ -96,36 +99,39 @@ def spreads(limit: int = 20):
         ),
         ranked as (
             select *,
-                   row_number() over (partition by symbol_canonical
+                   row_number() over (partition by base_coin
                                       order by apy_norm desc, exchange) as rk_high,
-                   row_number() over (partition by symbol_canonical
+                   row_number() over (partition by base_coin
                                       order by apy_norm asc,  exchange) as rk_low,
-                   count(*)     over (partition by symbol_canonical) as listings
+                   count(distinct exchange) over (partition by base_coin) as listings
             from latest
         ),
         shorts as (
-            select symbol_canonical, listings,
-                   exchange       as venue_short,
-                   apy_norm       as short_apy,
-                   volume_24h_usd as short_vol_usd
+            select base_coin, listings,
+                   exchange         as venue_short,
+                   symbol_canonical as short_symbol,
+                   apy_norm         as short_apy,
+                   volume_24h_usd   as short_vol_usd
             from ranked where rk_high = 1
         ),
         longs as (
-            select symbol_canonical,
-                   exchange       as venue_long,
-                   apy_norm       as long_apy,
-                   volume_24h_usd as long_vol_usd
+            select base_coin,
+                   exchange         as venue_long,
+                   symbol_canonical as long_symbol,
+                   apy_norm         as long_apy,
+                   volume_24h_usd   as long_vol_usd
             from ranked where rk_low = 1
         )
-        select s.symbol_canonical,
+        select s.base_coin,
                s.listings,
-               s.venue_short, l.venue_long,
+               s.venue_short, s.short_symbol,
+               l.venue_long,  l.long_symbol,
                round(s.short_apy * 100, 1)                  as short_apy_pct,
                round(l.long_apy  * 100, 1)                  as long_apy_pct,
                round((s.short_apy - l.long_apy) * 100, 1)   as delta_apy_pct,
                round(s.short_vol_usd / 1e6, 1)              as short_vol_musd,
                round(l.long_vol_usd  / 1e6, 1)              as long_vol_musd
-        from shorts s join longs l using (symbol_canonical)
+        from shorts s join longs l using (base_coin)
         where s.listings >= 2
           and s.short_vol_usd >= 1e6 and l.long_vol_usd >= 1e6
         order by delta_apy_pct desc

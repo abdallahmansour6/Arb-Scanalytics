@@ -26,6 +26,7 @@ flags, loops until SIGTERM/SIGINT.
 import argparse
 import asyncio
 import logging
+import re
 import signal
 import time
 from collections import Counter
@@ -72,7 +73,8 @@ from config import (VENUES, FUNDING_DIR, POLL_INTERVAL_S,
 SCHEMA = pa.schema([
     ("ts_utc",             pa.int64()),    # ms since epoch (UTC)
     ("exchange",           pa.string()),
-    ("symbol_canonical",   pa.string()),
+    ("symbol_canonical",   pa.string()),   # CCXT-unified, venue-truth (e.g. '1000000CHEEMS/USDT:USDT')
+    ("base_coin",          pa.string()),   # multiplier-prefix-stripped base for cross-venue grouping
     ("funding_rate",       pa.float64()),  # (B) upcoming-boundary rate
     ("funding_interval_h", pa.float32()),  # authoritative; NULL if unobtainable
     ("predicted_rate",     pa.float64()),  # (C) cycle-after forecast
@@ -119,6 +121,30 @@ def _canonical_symbol(market: dict) -> str:
     return market["symbol"]
 
 
+# Multiplier-prefix stripper for cross-venue base_coin grouping.
+# Different venues list the same underlying token under different
+# contract-size multipliers — e.g. CHEEMS-the-meme appears on the wire as
+# `CHEEMS` (COINEX/GATE.IO/MEXC), `1000CHEEMS` (BINANCE/BINGX/BITMART/
+# KUCOIN/PHEMEX/XT), `1MCHEEMS` (BITGET), and `1000000CHEEMS` (BYBIT).
+# All four are the same coin; the prefix is purely a display convention
+# for tokens whose 1× spot price is too small to render legibly. Funding
+# rate is a percentage of contract value and is invariant under the
+# multiplier, so cross-multiplier spread arithmetic is sound.
+#
+# The lookahead `(?=[A-Za-z])` is what protects coins like `1INCH`
+# (digits-then-letters with no zero) from being mis-stripped. Verified
+# safe against `1INCH`, `BTC`, `ETH`. Strips: `100`, `1000`, `10000`,
+# `100000`, `1000000`, `10000000`, `1K`, `1M` (case-insensitive).
+_MULTIPLIER_PREFIX = re.compile(r"^(?:1[KM]|10{2,7})(?=[A-Za-z])", re.IGNORECASE)
+
+
+def _base_coin(market: dict) -> str:
+    """Strip multiplier prefix from market.base. Returns base unchanged
+    when no prefix matches. Stored as `base_coin` and used as the
+    cross-venue grouping key in the spreads view."""
+    return _MULTIPLIER_PREFIX.sub("", market.get("base", ""))
+
+
 def _apy_norm(rate, interval_h):
     """rate (per-epoch fraction) × 8760 / interval_h → annualized fraction."""
     if rate is None or not interval_h:
@@ -138,7 +164,7 @@ def _utc_next_boundary(ts_ms: int, interval_h: float | None) -> int | None:
     return ((ts_ms // interval_ms) + 1) * interval_ms
 
 
-def _build_row(*, ts_ms, exchange, symbol, funding_rate, interval_h,
+def _build_row(*, ts_ms, exchange, symbol, base_coin, funding_rate, interval_h,
                predicted=None, next_ts=None, mark=None, index=None,
                last=None, oi_usd=None, vol_usd=None) -> dict:
     """Assemble one canonical row. The only derivations are apy_norm
@@ -157,6 +183,7 @@ def _build_row(*, ts_ms, exchange, symbol, funding_rate, interval_h,
         "ts_utc": ts_ms,
         "exchange": exchange,
         "symbol_canonical": symbol,
+        "base_coin": base_coin,
         "funding_rate": funding_rate,
         "funding_interval_h": float(interval_h) if interval_h else None,
         "predicted_rate": predicted,
@@ -251,6 +278,7 @@ async def collect_binance(c, ts_ms):
         row = _build_row(
             ts_ms=ts_ms, exchange="BINANCE",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=interval_by_sym.get(sym),
             next_ts=_f(f_info.get("nextFundingTime")),
@@ -309,6 +337,7 @@ async def collect_bingx(c, ts_ms):
         row = _build_row(
             ts_ms=ts_ms, exchange="BINGX",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=_f(f_info.get("fundingIntervalHours")),
             next_ts=_f(f_info.get("nextFundingTime")),
@@ -367,6 +396,7 @@ async def collect_bitget(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="BITGET",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(t_info.get("fundingRate")),
             interval_h=_f(m_info.get("fundInterval")),
             next_ts=None,  # derived in _build_row
@@ -404,6 +434,7 @@ async def collect_bitmart(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="BITMART",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(info.get("expected_funding_rate")),
             interval_h=_f(info.get("funding_interval_hours")),
             next_ts=_f(info.get("funding_time")),
@@ -439,6 +470,7 @@ async def collect_bybit(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="BYBIT",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(info.get("fundingRate")),
             interval_h=_f(info.get("fundingIntervalHour")),
             next_ts=_f(info.get("nextFundingTime")),
@@ -484,6 +516,7 @@ async def collect_coinex(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="COINEX",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=_parse_interval_str(f.get("interval")),
             next_ts=_f(f.get("fundingTimestamp")),
@@ -529,6 +562,7 @@ async def collect_gate(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="GATE.IO",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=_parse_interval_str(f.get("interval")),
             next_ts=_f(f.get("fundingTimestamp")),
@@ -573,6 +607,7 @@ async def collect_htx(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="HTX",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=_f(m_info.get("settlement_period")),
             next_ts=_f(f_info.get("next_funding_time")),
@@ -623,6 +658,7 @@ async def collect_kucoin(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="KUCOIN",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(info.get("fundingFeeRate")),
             interval_h=interval_h,
             next_ts=_f(info.get("nextFundingRateDateTime")),
@@ -684,6 +720,7 @@ async def collect_mexc(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="MEXC",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(native.get("fundingRate")),
             interval_h=_f(native.get("collectCycle")),
             next_ts=_f(native.get("nextSettleTime")),
@@ -736,6 +773,7 @@ async def collect_okx(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="OKX",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=_parse_interval_str(f.get("interval")),
             next_ts=_f(f.get("fundingTimestamp")),
@@ -779,6 +817,7 @@ async def collect_phemex(c, ts_ms):
         rows.append(_build_row(
             ts_ms=ts_ms, exchange="PHEMEX",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(info.get("fundingRateRr")),
             interval_h=interval_h,
             next_ts=None,  # derived in _build_row
@@ -828,6 +867,7 @@ async def collect_xt(c, ts_ms):
         return _build_row(
             ts_ms=ts_ms, exchange="XT.COM",
             symbol=_canonical_symbol(market),
+            base_coin=_base_coin(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=_f(f_info.get("collectionInternal")),
             next_ts=_f(f_info.get("nextCollectionTime")),

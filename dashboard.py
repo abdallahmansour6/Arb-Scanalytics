@@ -127,6 +127,24 @@ def _column_config(extra: dict | None = None) -> dict:
     cfg = {
         "exchange":           st.column_config.TextColumn("Exchange"),
         "symbol_canonical":   st.column_config.TextColumn("Symbol"),
+        "base_coin":          st.column_config.TextColumn(
+                                  "Base",
+                                  help="Underlying token, with multiplier prefix "
+                                       "(1000/1M/1000000) stripped. Used as the "
+                                       "cross-venue grouping key in the spreads "
+                                       "view, since the same coin can appear under "
+                                       "different contract-size multipliers across "
+                                       "venues (e.g. CHEEMS / 1000CHEEMS / "
+                                       "1000000CHEEMS are all the same underlying)."),
+        "short_symbol":       st.column_config.TextColumn(
+                                  "Short symbol",
+                                  help="The exact venue-specific contract you'd "
+                                       "fire on the short leg (matches the venue's "
+                                       "own listing, including any multiplier prefix)."),
+        "long_symbol":        st.column_config.TextColumn(
+                                  "Long symbol",
+                                  help="The exact venue-specific contract you'd "
+                                       "fire on the long leg."),
         "funding_rate":       st.column_config.NumberColumn("Rate (next epoch)", format="%.6f"),
         "predicted_rate":     st.column_config.NumberColumn("Forecast (cycle after)", format="%.6f"),
         "funding_interval_h": st.column_config.NumberColumn("Cycle h", format="%.0f"),
@@ -142,7 +160,8 @@ def _column_config(extra: dict | None = None) -> dict:
                                                             help="1 = highest OI globally"),
         "listings":           st.column_config.NumberColumn(
                                   "Listings", format="%d",
-                                  help="Total venues that list this symbol. "
+                                  help="Distinct venues that list this base_coin "
+                                       "in any multiplier variant. "
                                        "Filter-independent — does NOT change "
                                        "when you tweak the OI / volume / "
                                        "settlement filters."),
@@ -342,15 +361,19 @@ def render_spreads():
         st.info("No symbols match filters.")
         return
 
-    # Listings = total venue count per symbol, BEFORE the filter is applied.
-    # Stable across filter tweaks; informational only.
-    listings = snapshot.groupby("symbol_canonical")["exchange"].count()
+    # Spreads group by base_coin (multiplier-prefix-stripped base). This
+    # collapses listings like '1000CHEEMS', '1MCHEEMS', '1000000CHEEMS', and
+    # 'CHEEMS' onto the same logical token — they're the same underlying,
+    # priced under different per-contract multipliers. Funding rate is a
+    # percentage of contract value, so cross-multiplier ΔAPY is sound.
+    # Each leg row still surfaces its actual `symbol_canonical` so the
+    # trade routes to the correct venue-specific contract.
+    listings = snapshot.groupby("base_coin")["exchange"].nunique()
 
-    # idx_high / idx_low identify the venue at high/low APY for each symbol —
-    # the short and long legs you'd actually fire the trade against. EVERY
-    # leg-specific column below comes directly from those two rows, never
-    # from a min/max aggregation across other venues.
-    grouped = base.groupby("symbol_canonical")
+    # idx_high / idx_low identify the venue at high/low APY for each
+    # base_coin — the short and long legs you'd actually fire against.
+    # Every leg-specific column comes directly from those two rows.
+    grouped = base.groupby("base_coin")
     idx_high = grouped["apy_norm"].idxmax()
     idx_low = grouped["apy_norm"].idxmin()
     short_rows = base.loc[idx_high]
@@ -360,13 +383,15 @@ def render_spreads():
     agg = grouped.agg(
         n_venues_filtered=("exchange", "count"),
     ).reset_index()
-    agg["listings"]         = agg["symbol_canonical"].map(listings)
+    agg["listings"]          = agg["base_coin"].map(listings)
     agg["venue_short"]       = short_rows["exchange"].values
+    agg["short_symbol"]      = short_rows["symbol_canonical"].values
     agg["short_apy_pct"]     = short_rows["apy_norm"].values * 100
     agg["short_oi_rank"]     = short_rows["oi_rank"].values
     agg["short_vol_musd"]    = short_rows["volume_24h_usd"].values / 1e6
     agg["short_settles_in"]  = short_rows["settles_in_min"].values
     agg["venue_long"]        = long_rows["exchange"].values
+    agg["long_symbol"]       = long_rows["symbol_canonical"].values
     agg["long_apy_pct"]      = long_rows["apy_norm"].values * 100
     agg["long_oi_rank"]      = long_rows["oi_rank"].values
     agg["long_vol_musd"]     = long_rows["volume_24h_usd"].values / 1e6
@@ -384,11 +409,11 @@ def render_spreads():
     agg = agg.sort_values("delta_apy_pct", ascending=False)
 
     cols = [
-        "symbol_canonical", "listings",
+        "base_coin", "listings",
         "delta_apy_pct", "cycles_h",
-        "venue_short", "short_apy_pct", "short_oi_rank",
+        "venue_short", "short_symbol", "short_apy_pct", "short_oi_rank",
         "short_vol_musd", "short_settles_in",
-        "venue_long",  "long_apy_pct",  "long_oi_rank",
+        "venue_long",  "long_symbol",  "long_apy_pct",  "long_oi_rank",
         "long_vol_musd",  "long_settles_in",
     ]
     st.caption(f"{len(agg):,} symbols match filters")
