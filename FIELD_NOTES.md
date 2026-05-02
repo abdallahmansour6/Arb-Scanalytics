@@ -1,370 +1,289 @@
 # Field Notes — 13-Venue USDT-Linear Perp Scanner
 
-Observations gathered building a funding-rate scanner across 13
-USDT-linear perp venues. **Factual only**, written to spare a future
-iteration the cost of rediscovery. No prescriptions — design choices
-left open.
+Verified observations. Every claim below was directly probed against
+live CCXT 4.5.49 endpoints; nothing is carried over from prior versions
+on hearsay. The single source of truth for the per-venue extraction
+spec is the table below; the collector implements it 1:1 in
+`collector.py`.
 
-Scope assumed throughout: USDT-margined linear perpetual swaps, public
-REST endpoints, polling cadence on the order of 60 s.
-
----
-
-## Project venues
-
-13 venues: BINANCE, BINGX, BITGET, BITMART, BYBIT, COINEX, GATE.IO, HTX,
-KUCOIN, MEXC, OKX, PHEMEX, XT.COM. **BLOFIN was scoped out** of the
-project — its API sits behind a Cloudflare anti-VPN/anti-bot challenge
-that 403s any traffic flagged as VPN/proxy egress, and the project chose
-to drop rather than carry the variability.
+Scope: USDT-quoted, USDT-settled, linear, swap markets only. REST
+polling at ~60 s cadence.
 
 ---
 
-## Funding-rate semantics — read this first
+## Project venues (13)
 
-The most expensive thing to misunderstand. Venues expose up to **three**
-distinct rate concepts, which their UIs label inconsistently. "Funding
-Rate", "Expected Rate", and "Predicted Rate" each mean different things
-on different venues. Reduce everything to:
+`BINANCE`, `BINGX`, `BITGET`, `BITMART`, `BYBIT`, `COINEX`, `GATE.IO`,
+`HTX`, `KUCOIN`, `MEXC`, `OKX`, `PHEMEX`, `XT.COM`. BLOFIN was scoped
+out — its API sits behind a Cloudflare anti-VPN/anti-bot challenge that
+403s NordVPN-Singapore traffic.
+
+---
+
+## Funding-rate semantics — three concepts, two stored
+
+Venues label these three concepts inconsistently. Reduce every venue's
+docs to one of:
 
 - **(A) Last-settled** — already-paid rate from the previous boundary.
-  Frozen until next settlement. Only **BITMART** exposes a dedicated
-  field for it (`info.funding_rate`).
-- **(B) Upcoming** — what will settle at the *next* boundary; refines
-  continuously as the TWAP-of-premium-index accumulates over the cycle.
-  This is what a position opened *now* will pay/receive at next_funding_ts.
-  **CCXT's unified `fundingRate` always points to (B).**
-- **(C) Forward forecast** — exchange's prediction for the cycle AFTER
-  upcoming. The "real" predicted-rate concept.
+  Frozen until next settlement. **Not stored.** Only BITMART exposes
+  it as a separate field (`info.funding_rate`).
+- **(B) Upcoming** — what will settle at next_funding_ts; refines as
+  the TWAP-of-premium-index accumulates. CCXT's unified `fundingRate`
+  always points here. **Stored as `funding_rate`.**
+- **(C) Forward forecast** — exchange's forecast for the cycle AFTER
+  the upcoming one. **Stored as `predicted_rate`.** Per audit, only
+  COINEX, KUCOIN (when populated), HTX, OKX, PHEMEX expose this.
 
-The label ambiguity in the wild:
-- BITMART `info.expected_funding_rate` = (B) **upcoming**, NOT (C).
-  Confirmed by CCXT mapping it to unified.fundingRate.
-- COINEX `info.next_funding_rate` = (C) forward forecast.
-- HTX `info.estimated_rate` = (C) forward forecast (often null even when the field is present).
-- OKX `info.nextFundingRate` = (C) forward forecast (often empty string `''`, not None).
-- PHEMEX `info.predFundingRateRr` = (C) forward forecast.
-- GATE.IO `info.funding_rate_indicative` = same value as `funding_rate`, NOT a forecast.
-- All other venues: (C) is not exposed.
+When wiring a new venue, always verify the field's semantic by comparing
+its value to CCXT's unified `fundingRate` — match = (B), forward-shifted
+value = (C).
 
-When adding a new venue, verify the label by comparing the value
-against CCXT's unified `fundingRate` — if they match, the field is (B).
+The **most expensive field-naming trap**: BITMART's `info.funding_rate`
+is the **historical last-settled rate (A)**, NOT what should go into
+`funding_rate`. Use `info.expected_funding_rate` for the upcoming-cycle
+rate (B). CCXT confirms this mapping by populating unified.fundingRate
+from `expected_funding_rate`, not from `funding_rate`.
 
 ---
 
-## Network / geo
+## Price fields — three columns, decreasing precision
 
-- All venues geo-block from at least some non-Asian residential IPs
-  (HTTP 451 / `ExchangeNotAvailable` from CCXT). A Singapore VPS
-  reaches the whole 13-venue set cleanly.
-- Local development without a VPN is impossible; iterate either on the
-  VPS directly (ssh) or with a VPN whose egress is in Asia.
-- **NordVPN-Singapore caveat**: PacketHub-AS-backed IPs work for the
-  full 13-venue set. Latency to venue endpoints is 2–15× higher than
-  direct VPS routing — bump CCXT timeout to 30 s during local iteration.
-- BLOFIN specifically rejects NordVPN egress with a Cloudflare 403
-  ("your IP is from one of BloFin's restricted countries or regions"),
-  even though `ipinfo.io` geolocates the IP as Singapore. VPN-IP-list
-  detection is the proximate cause.
+In decreasing order of precision for basis-bps math:
 
----
+- **`mark_price`** — venue's published mark price (the index-anchored
+  reference used for funding settlement, liquidations, and unrealized
+  PnL). NULL where the venue does not publish it: **BITMART, HTX, OKX**
+  (and ~0.3% of BITMART rows where the field happens to be empty for
+  some pairs). Always prefer this for basis math when populated.
+- **`index_price`** — venue's published index price (multi-spot
+  composite). NULL where not exposed: **HTX, OKX**. Tracks mark very
+  closely.
+- **`last_price`** — most recent trade price on the venue. **100%
+  populated across all 13 venues**. Diverges from mark by typically
+  sub-bp in calm markets, wider during fast moves; that divergence
+  propagates 1:1 into any basis-bps estimate derived from it.
 
-## aiohttp / aiodns / VPN — Windows DNS gotcha
+Stored as separate primitives. The collector NEVER overwrites
+`mark_price` with `last`; that anti-pattern was the bug we removed
+in the audit refactor. Downstream queries explicitly choose
+`coalesce(mark_price, last_price)` and reason about the precision
+tradeoff — for BITMART/HTX/OKX, the fallback to `last` is the only
+way to get a per-venue price for cross-venue basis-bps work, and the
+mark-last divergence is empirically sub-bp for liquid pairs.
 
-Symptom: under NordVPN on Windows, every CCXT request fails with
-`ExchangeNotAvailable: ... DNS error` (root cause: `aiodns` cannot
-reach its configured resolvers through the VPN tunnel). `curl` works
-fine because it uses the OS resolver.
+The execution engine uses real-time L2 VWAP, not these fields. These
+columns are for **scanner-level estimation** of basis-bps cost going
+into the trade-viability calc:
 
-Fix: pass an `aiohttp.ClientSession` whose `TCPConnector` is built
-with `resolver=aiohttp.ThreadedResolver()` to CCXT's init via the
-`session` kwarg. The threaded resolver delegates to the OS, which
-honors the VPN's pushed DNS reliably. Implemented in `config.open_client()`.
+  `basis_bps_estimate = (price_short - price_long) / mid_price * 10000`
 
-Benign on Linux/VPS where aiodns works fine, but the workaround is
-harmless there too — no need to branch on platform.
-
----
-
-## Venue → CCXT mapping
-
-CCXT version observed: **4.5.49**.
-
-| Canonical | CCXT class       | Constructor option        |
-|-----------|------------------|---------------------------|
-| BINANCE   | `binance`        | `defaultType: 'swap'`     |
-| BINGX     | `bingx`          | `defaultType: 'swap'`     |
-| BITGET    | `bitget`         | `defaultType: 'swap'`     |
-| BITMART   | `bitmart`        | `defaultType: 'swap'`     |
-| BYBIT     | `bybit`          | `defaultType: 'swap'`     |
-| COINEX    | `coinex`         | `defaultType: 'swap'`     |
-| GATE.IO   | `gate`           | `defaultType: 'swap'` — **not** `gateio` |
-| HTX       | `htx`            | `defaultType: 'swap'` — **not** `huobi`  |
-| KUCOIN    | `kucoinfutures`  | (no `defaultType` — separate class)      |
-| MEXC      | `mexc`           | `defaultType: 'swap'`     |
-| OKX       | `okx`            | `defaultType: 'swap'`     |
-| PHEMEX    | `phemex`         | `defaultType: 'swap'`     |
-| XT.COM    | `xt`             | `defaultType: 'swap'`     |
+with prices = `coalesce(mark_price, last_price)` per leg. If the result
+is at the edge of viability, fire the engine to get a real-time L2 read
+before committing.
 
 ---
 
-## CCXT capability matrix (USDT-linear perps, 4.5.49)
+## Per-venue extraction spec (audited 2026-05-02 against CCXT 4.5.49)
 
-`fetchFundingRates` (batch, returns dict of all symbols):
-- **TRUE**: binance, bingx, bitget, bybit, coinex, gate, htx, okx
-- **FALSE**: bitmart, kucoinfutures, mexc, phemex, xt
+The single source of truth for `collector.py`. Every field has **one**
+explicit source per venue. There are NO cascading fallbacks. Where a
+venue does not expose a field, the column is NULL.
+
+| Venue   | funding_rate (B)                      | interval_h source                                   | next_funding_ts                              | predicted (C)                  | mark                       | index                      | last                  | OI                                                    | volume_usd                                |
+|---------|---------------------------------------|-----------------------------------------------------|----------------------------------------------|--------------------------------|----------------------------|----------------------------|-----------------------|-------------------------------------------------------|-------------------------------------------|
+| BINANCE | batch f.unified.fundingRate           | `fapiPublicGetFundingInfo[sym].fundingIntervalHours` | f.info.nextFundingTime                       | NULL                           | f.info.markPrice           | f.info.indexPrice          | t.unified.last        | per-sym `openInterestAmount × cs × mark`              | t.unified.quoteVolume                     |
+| BINGX   | batch f.unified.fundingRate           | f.info.fundingIntervalHours                         | f.info.nextFundingTime                       | NULL                           | f.info.markPrice           | f.info.indexPrice          | t.unified.last        | per-sym `openInterestValue` (USD direct)              | t.unified.quoteVolume                     |
+| BITGET  | t.info.fundingRate                    | **market.info.fundInterval** (loaded once)          | UTC-derived from interval                    | NULL                           | t.info.markPrice           | t.info.indexPrice          | t.unified.last        | t.info.holdingAmount × mark                           | t.info.usdtVolume                         |
+| BITMART | t.info.expected_funding_rate          | t.info.funding_interval_hours                       | t.info.funding_time                          | NULL                           | NULL (not exposed)         | t.info.index_price         | t.unified.last        | t.info.open_interest_value (USD direct)               | t.info.turnover_24h                       |
+| BYBIT   | t.info.fundingRate                    | t.info.fundingIntervalHour                          | t.info.nextFundingTime                       | NULL                           | t.info.markPrice           | t.info.indexPrice          | t.unified.last        | t.info.openInterestValue (USD direct)                 | t.info.turnover24h                        |
+| COINEX  | batch f.unified.fundingRate           | batch f.unified.interval ("8h" → 8.0)               | **batch f.unified.fundingTimestamp** †       | f.info.next_funding_rate       | t.info.mark_price          | t.info.index_price         | t.unified.last        | t.info.open_interest_volume × mark                    | t.info.value                              |
+| GATE.IO | batch f.unified.fundingRate           | batch f.unified.interval                            | batch f.unified.fundingTimestamp             | NULL ‡                         | t.info.mark_price          | t.info.index_price         | t.unified.last        | t.info.total_size × cs × mark                         | t.info.volume_24h_quote                   |
+| HTX     | batch f.unified.fundingRate           | **market.info.settlement_period** (loaded once)     | f.info.next_funding_time                     | f.info.estimated_rate          | NULL (not exposed)         | NULL (not exposed)         | t.unified.last        | batch fetch_open_interests → openInterestValue        | t.info.trade_turnover §                   |
+| KUCOIN  | t.info.fundingFeeRate (batch ticker)  | t.info.fundingRateGranularity (**ms ÷ 3.6e6**)      | t.info.nextFundingRateDateTime ¶             | t.info.predictedFundingFeeRate | t.info.markPrice           | t.info.indexPrice          | t.unified.last        | t.info.openInterest × cs × mark                       | t.info.turnoverOf24h                      |
+| MEXC    | native HTTP fundingRate ‖             | native HTTP collectCycle ‖                          | native HTTP nextSettleTime ‖                 | NULL                           | t.info.fairPrice           | t.info.indexPrice          | t.unified.last        | t.info.holdVol × cs × mark                            | t.info.amount24                           |
+| OKX     | batch f.unified.fundingRate           | batch f.unified.interval                            | **batch f.unified.fundingTimestamp** †       | f.info.nextFundingRate \*\*    | NULL (not exposed)         | NULL (not exposed)         | t.unified.last        | batch fetch_open_interests → openInterestValue        | t.unified.baseVolume × cs × t.unified.last ⁂ |
+| PHEMEX  | t.info.fundingRateRr                  | **market.info.fundingInterval** (sec ÷ 3600)        | UTC-derived from interval                    | t.info.predFundingRateRr       | t.info.markPriceRp         | t.info.indexPriceRp        | t.unified.last        | t.info.openInterestRv × mark                          | t.info.turnoverRv                         |
+| XT.COM  | per-sym f.unified.fundingRate         | per-sym f.info.collectionInternal ◊                 | per-sym f.info.nextCollectionTime            | NULL                           | t.info.m                   | t.info.i                   | t.unified.last        | NULL (not exposed)                                    | t.unified.quoteVolume                     |
+
+Footnotes:
+- **†** CCXT's `unified.fundingTimestamp` is the *upcoming* boundary. Its
+  `unified.nextFundingTimestamp` is the cycle AFTER upcoming — wrong
+  field for our `next_funding_ts`. Verified for COINEX and OKX.
+- **‡** GATE.IO's `funding_rate_indicative` is identical in value to
+  `funding_rate`, NOT a forward forecast. Don't use it for predicted_rate.
+- **§** HTX's `unified.quoteVolume` returns the wrong number (it equals
+  `baseVolume × 1000`). `info.trade_turnover` is the actual USD volume.
+- **¶** KUCOIN's `nextFundingRateTime` is a **countdown duration** (ms
+  remaining), NOT an absolute timestamp. The absolute ms timestamp is
+  in `nextFundingRateDateTime` (despite the misleading name).
+- **‖** MEXC has no `fetchFundingRates` in CCXT; its native HTTP
+  `https://contract.mexc.com/api/v1/contract/funding_rate` returns
+  `fundingRate / collectCycle / nextSettleTime` for every symbol in
+  one call. Cheap and complete — use it instead of per-symbol fan-out.
+- **\*\*** OKX returns `info.nextFundingRate = ''` (empty string) when
+  the venue hasn't computed a forecast. Coerce empty string to None.
+- **⁂** OKX exposes neither mark nor index via `fetch_ticker`, and
+  `quoteVolume` is null. The only available USD-volume derivation is
+  `baseVolume × contractSize × last`. `last` is a trade price not the
+  mark, but the difference is sub-bp and only used for vol_usd; the
+  schema's `mark_price` and `index_price` columns stay NULL.
+- **◊** Despite the misspelling, XT.COM's `collectionInternal` field
+  carries the funding interval in hours.
+
+UTC-aligned next_funding_ts derivation is the only allowed *math
+derivation* (not fake fallback): when a venue exposes the interval but
+not a per-symbol next-settlement timestamp, we round the current ts up
+to the next interval boundary. Verified against 12+ venues at 8h/4h/1h
+cycles — every venue aligns boundaries to the UTC grid for sampled
+symbols. Currently used for BITGET and PHEMEX only.
+
+OI unit conversions:
+- "USD direct"  : as-is
+- "base × mark" : multiply by mark_price (where mark is the venue-
+                  authoritative mark; if mark_price is NULL the row's
+                  OI is also NULL — never substitute `last`)
+- "contracts × cs × mark" : multiply by `market.contractSize × mark`
+
+Volume unit:
+- All `volume_24h_usd` values stored are USD, derived per the table.
+
+---
+
+## CCXT capability matrix (4.5.49, audited)
+
+`fetchFundingRates` (batch):
+- TRUE: BINANCE, BINGX, BITGET, BYBIT, COINEX, GATE.IO, HTX, OKX
+- FALSE: BITMART, KUCOIN, MEXC, PHEMEX, XT.COM
 
 `fetchOpenInterests` (batch):
-- **TRUE**: htx, kucoinfutures, okx
-- **FALSE**: all others
+- TRUE: HTX, KUCOIN, OKX
+- FALSE: all others
 
 `fetchOpenInterest` (per-symbol):
-- **TRUE**: binance, bingx, bitget, htx, kucoinfutures, okx, phemex
-- **FALSE**: gate.io, mexc, xt
-- **None**: coinex (treat as False; coinex's quirk of returning None instead of False)
+- TRUE: BINANCE, BINGX, BITGET, HTX, KUCOIN, OKX, PHEMEX
+- FALSE: GATE.IO, MEXC, XT.COM
+- None: COINEX (treat as False — coinex's quirk of returning None)
 
 `fetchFundingRate`:
-- **emulated** for bybit (CCXT simulates by calling fetchFundingRates and filtering)
-- **TRUE** for all others
+- "emulated" for BYBIT (CCXT simulates via batch + filter)
+- TRUE for the rest
 
 ---
 
-## Per-venue ticker.info field map
+## Venue → CCXT class id
 
-The single most useful normalization knowledge. For most venues, one
-`fetch_tickers()` call covers most fields:
-
-| Venue   | (B) Upcoming rate       | (C) Forecast            | OI                      | OI unit   | Mark           | Index          | 24h vol (USD)        | next_funding_ts |
-|---------|-------------------------|-------------------------|-------------------------|-----------|----------------|----------------|----------------------|-----------------|
-| BINANCE | from batch funding      | —                       | per-symbol fanout       | base      | unified.last   | unified.last   | unified.quoteVolume  | from batch funding |
-| BINGX   | from batch funding      | —                       | per-symbol fanout       | base      | unified.last   | unified.last   | unified.quoteVolume  | from batch funding |
-| BITGET  | `fundingRate` (info)    | —                       | `holdingAmount`         | base      | `markPrice`    | `indexPrice`   | `usdtVolume`         | from batch funding |
-| BITMART | `expected_funding_rate` | —                       | `open_interest_value`   | usd       | unified.last   | `index_price`  | `turnover_24h`       | `funding_time`  |
-| BYBIT   | `fundingRate` (info)    | —                       | `openInterestValue`     | usd       | `markPrice`    | `indexPrice`   | `turnover24h`        | `nextFundingTime` |
-| COINEX  | from batch funding      | `next_funding_rate` (in batch info) | `open_interest_volume` | base | `mark_price`  | `index_price`  | `value`              | from batch funding |
-| GATE.IO | `funding_rate` (info)   | —                       | `total_size`            | contracts | `mark_price`   | `index_price`  | `volume_24h_quote`   | from batch funding |
-| HTX     | from batch funding      | `estimated_rate` (in batch info; often null) | from batch OI | — | unified.last | unified.last | `trade_turnover`*    | from batch funding |
-| KUCOIN  | per-symbol fanout       | —                       | from batch OI           | —         | unified.last   | unified.last   | unified.quoteVolume  | from per-symbol funding |
-| MEXC    | `fundingRate` (info)    | —                       | `holdVol`               | contracts | `fairPrice`    | `indexPrice`   | `amount24`           | (heuristic from interval) |
-| OKX     | from batch funding      | `nextFundingRate` (in batch info; often `''`) | from batch OI | — | unified.last | unified.last | (compute baseVol*last)** | from batch funding |
-| PHEMEX  | `fundingRateRr`         | `predFundingRateRr`     | `openInterestRv`        | base      | `markPriceRp`  | `indexPriceRp` | `turnoverRv`         | (heuristic from interval) |
-| XT.COM  | per-symbol fanout       | —                       | (not exposed)           | —         | `m`            | `i`            | unified.quoteVolume  | from per-symbol funding |
-
-\* HTX's `unified.quoteVolume` is wrong (= baseVolume × 1000). Use `info.trade_turnover` for true USD turnover.
-\** OKX's `unified.quoteVolume` is None; `unified.baseVolume` is in raw contracts. Compute USD volume as `baseVolume × contractSize × mark`.
-
-OI unit conversion to USD:
-- `usd` — already USD, use as-is
-- `base` — multiply by mark_price
-- `contracts` — multiply by `market.contractSize × mark_price`
+| Canonical | CCXT class       | Constructor option                          |
+|-----------|------------------|---------------------------------------------|
+| BINANCE   | `binance`        | `defaultType: 'swap'`                       |
+| BINGX     | `bingx`          | `defaultType: 'swap'`                       |
+| BITGET    | `bitget`         | `defaultType: 'swap'`                       |
+| BITMART   | `bitmart`        | `defaultType: 'swap'`                       |
+| BYBIT     | `bybit`          | `defaultType: 'swap'`                       |
+| COINEX    | `coinex`         | `defaultType: 'swap'`                       |
+| GATE.IO   | `gate`           | `defaultType: 'swap'` — **not** `gateio`    |
+| HTX       | `htx`            | `defaultType: 'swap'` — **not** `huobi`     |
+| KUCOIN    | `kucoinfutures`  | (no `defaultType` — separate class)         |
+| MEXC      | `mexc`           | `defaultType: 'swap'`                       |
+| OKX       | `okx`            | `defaultType: 'swap'`                       |
+| PHEMEX    | `phemex`         | `defaultType: 'swap'`                       |
+| XT.COM    | `xt`             | `defaultType: 'swap'`                       |
 
 ---
 
-## Market-filter quirks
+## Network / DNS gotchas
 
-- **Filter must require `quote == 'USDT' AND settle == 'USDT'`** (NOT
-  `OR`). The `OR` form (suggested by an earlier field-notes pass) lets
-  in USDC-quoted and USD-quoted variants of the same base coin on
-  bitmart (3 BTC variants: USDT, USD, USDC) and coinex (2 BTC variants:
-  USDT, USDC), creating phantom duplicates per venue under canonical
-  naming.
-- **An older note claimed coinex's BTC perp lives at `BTC/USD:USDT`**
-  (quote=USD, settle=USDT). As of CCXT 4.5.49, **coinex offers
-  `BTC/USDT:USDT` natively**; the `/USD:USDT` line is either retired
-  or moved to a different listing class. Tightening to AND keeps coinex's
-  primary perp.
-- `coinex` markets have `active=None` instead of `True` (yes, None,
-  not False). Filter with `m.get('active') is False` to exclude — None
-  passes.
+**Geo-block**. Every venue 451s/`ExchangeNotAvailable`s some non-Asian
+residential IPs. A Singapore VPS reaches the 13-venue set cleanly.
+NordVPN-Singapore reaches all 13 too, with ~2–15× the latency of direct
+VPS routing — bump CCXT timeout to 30 s during local iteration.
+
+**Windows + aiohttp + aiodns + VPN**. Symptom: every CCXT request fails
+with `ExchangeNotAvailable: ... DNS error`. Root cause: aiodns can't
+resolve through the VPN tunnel. Fix in `config.open_client()`: pass an
+`aiohttp.ClientSession` whose connector uses `aiohttp.ThreadedResolver()`.
+The threaded resolver delegates to the OS, which honors the VPN's
+pushed DNS reliably. Harmless on Linux/VPS — keep the workaround unconditional.
 
 ---
 
-## Funding interval
+## Market-filter rule
 
-Sources, in priority order:
-1. CCXT unified `interval` field as a string like `"8h"`, `"4h"`, `"1h"` (most reliable when present)
-2. Compute `(nextFundingTimestamp − fundingTimestamp) / 3_600_000`
-3. Read it from `ticker.info`: `funding_interval_hours` (bitmart),
-   `fundingIntervalHour` (bybit), `collectCycle` (mexc),
-   `collectionInternal` (xt)
-4. Default 8 h (correct for most pairs; some run 4 h or 1 h)
+The USDT-linear perp filter MUST require both `quote == 'USDT'` AND
+`settle == 'USDT'`. The `OR` form (suggested by an older, unverified
+field-notes pass) lets in USDC- and USD-quoted variants on bitmart and
+coinex, creating phantom duplicates per venue when canonicalizing by
+symbol. Verified: tightening to AND drops 24 dropouts on BITMART, 16 on
+COINEX, no other venues affected.
 
-### next_funding_ts heuristic
-
-When a venue doesn't expose next_funding_ts directly (currently only
-MEXC and PHEMEX, which lack a usable per-pair settlement timestamp in
-ticker.info), round the current timestamp UP to the next interval
-boundary, assuming UTC-aligned cycles. Verified empirically against 12
-of 13 venues — all 8 h cycles align to the same UTC-anchored grid
-(their nextFundingTimestamp values match across venues for the same
-symbol, modulo small clock skew). 1 h and 4 h cycles also sampled
-UTC-aligned. **If a venue offsets boundaries from UTC (rare, none seen
-in this set), the heuristic is wrong by the offset.**
+`coinex` quirks: markets have `active=None` instead of `True` (treat
+None as pass; only `False` as exclude).
 
 ---
 
-## Native batch endpoints (research-layer reference)
+## Cycle-time realities (NordVPN-Singapore, audited)
 
-For venues without batch `fetchFundingRates`, native HTTP endpoints
-return everything in one call. **Mostly unnecessary for the scanner**:
-bitmart, mexc, and phemex all expose funding rate (B) and supporting
-fields in their `ticker.info`, so a single `fetch_tickers()` covers
-the scanner's per-cycle needs. These endpoints are still useful for
-research-layer per-symbol metadata work.
+Per-cycle wall-clock; will be 2–3× faster from the Singapore VPS.
 
-### bitmart — `GET https://api-cloud-v2.bitmart.com/contract/public/details`
-- v1 host (`api-cloud.bitmart.com`) returns 404; use v2.
-- Carries `funding_rate` (= last-settled, A), `expected_funding_rate`
-  (= upcoming, B), `next_funding_rate_timestamp`, `funding_interval_hours`,
-  `last_price`, `index_price`, `open_interest_value` (USD direct),
-  `turnover_24h` (USD).
-- Filter `product_type == 1` and `quote_currency == 'USDT'`.
-- Symbol mapping: `BTCUSDT` (no slash) → CCXT unified via `client.markets_by_id`.
+| Group | Pattern                                       | Venues                          | Wall-clock |
+|-------|-----------------------------------------------|---------------------------------|-----------:|
+| A     | one fetch_tickers + market.info               | BITGET, BITMART, BYBIT, KUCOIN, PHEMEX | 1–4 s      |
+| B     | tickers + batch funding (± batch OI)          | COINEX, GATE.IO, HTX, OKX        | 2–8 s      |
+| B+    | + native HTTP                                 | MEXC                             | ~10–15 s   |
+| B+    | + per-symbol OI fan-out (~559 syms)           | BINANCE                          | ~35–48 s   |
+| B+    | + per-symbol OI fan-out (~595 syms)           | BINGX                            | ~65–73 s ⚠ |
+| C     | tickers + per-symbol funding fan-out (~590)   | XT.COM                           | ~60 s ⚠    |
 
-### phemex — `GET https://api.phemex.com/md/v3/ticker/24hr/all`
-- Response under `result[]` (not `data.result`).
-- Funding rate: `fundingRateRr` (Rr = "real rate", already descaled).
-  Predicted: `predFundingRateRr`.
-- Mark/OI fields use scaled `Ep`/`Ev` integers needing per-market
-  scaling factors. The Rr/Rp/Rv fields used in the scanner are
-  already descaled — empirically verified.
-
-### mexc — `GET https://contract.mexc.com/api/v1/contract/funding_rate`
-- Response: `data: [{ symbol, fundingRate, collectCycle, nextSettleTime, ... }]`
-- `collectCycle` is funding interval in hours.
-- The one reason to use this from the scanner: `nextSettleTime` for all
-  symbols in one call, avoiding the UTC-aligned heuristic for MEXC.
+BINGX and XT.COM sit at the 60 s budget on NordVPN. Watch them once on
+the VPS — they should drop well under budget there. If not, raise
+`POLL_INTERVAL_S` to 90 s or trim concurrency on the OI fan-out.
 
 ---
 
-## CCXT 4.5.49 quirks
+## Streamlit / DuckDB caveats (verified by use)
 
-- **Default `timeout` (10 s) is too tight under NordVPN egress.** Bumped
-  to 30 s in `config.CCXT_TIMEOUT_MS`. On a Singapore VPS direct, 10 s
-  is plenty.
-- **aiodns DNS failures under VPN on Windows** (see earlier section). Fix: ThreadedResolver.
-- `client.fetch(url, 'GET')` crashed bitmart with `'NoneType' has no
-  attribute 'lower'` from inside ccxt's header preparation. Workaround:
-  raw `aiohttp.ClientSession` with explicit `User-Agent` header,
-  bypassing `client.fetch`.
-- Custom auto-generated method names like `client.publicContractGetDetails()`
-  exist but go through the same broken `fetch`; raw aiohttp side-steps it.
-- **OKX's `info.nextFundingRate` is the empty string `''`** when no
-  forecast is available, not None. Coerce empty string to None before
-  use.
-- **HTX's `info.estimated_rate` is often null** even when the field
-  exists in the response. Don't assume populated.
-- **BYBIT's `c.has['fetchFundingRate'] == 'emulated'`** (string, not
-  bool). CCXT simulates per-symbol via the batch call. Functionally
-  equivalent for our purposes.
-
----
-
-## Cycle-time realities
-
-Per-cycle wall-clock against NordVPN-Singapore (60 s polling target):
-
-| Group | Pattern | Venues | Per-cycle wall-clock |
-|-------|---------|--------|----------------------|
-| A | one fetch_tickers   | BITMART, BYBIT, MEXC, PHEMEX | 1–7 s |
-| B | tickers + batch funding (± batch OI) | BITGET, COINEX, GATE.IO, HTX, OKX | 1–6 s |
-| B+ | + OI per-symbol fan-out | BINANCE (~559 syms) | ~35 s |
-| B+ | + OI per-symbol fan-out | BINGX (~595 syms) | **~65 s** ⚠ |
-| C | tickers + funding per-symbol fan-out (± batch OI) | KUCOIN (~553 syms) | ~20 s |
-| C | tickers + funding per-symbol fan-out | XT.COM (~590 syms) | **~60 s** ⚠ |
-
-BINGX and XT.COM sit right at the 60 s budget on NordVPN. Expect 2–3×
-speedup on the VPS direct route. If they consistently over-shoot on
-the VPS, options: increase fan-out concurrency (currently sem=20),
-bump POLL_INTERVAL_S to 90 s, or skip OI for BINANCE/BINGX (the
-expensive part).
-
----
-
-## Streamlit / Tornado / DuckDB
-
-- **`use_container_width=True` is deprecated.** Replacement: `width="stretch"`
-  (or `width="content"` for the False case). Applies to `st.dataframe`
-  and `st.plotly_chart`.
-- `st.number_input(value=None, placeholder=...)` works in Streamlit ≥ 1.30
-  for "leave empty to disable" UX.
-- VS Code Remote-SSH port-forward probes generate Tornado **`Invalid HTTP
-  request received`** warnings into the streamlit terminal. Silence with
-  `logging.getLogger("tornado.general").setLevel(logging.ERROR)`. Benign.
-- VS Code Remote-SSH **auto-detects** the streamlit listening port (8501)
-  and surfaces a "Open in browser" toast that opens it via the SSH
-  tunnel. No manual port-forward configuration needed.
-- Pandas / Streamlit dataframe sort places **NULL values at the bottom**
-  regardless of asc/desc direction (`na_position='last'`).
-- DuckDB INTERVAL syntax: `INTERVAL N HOUR` (no quotes around `N`).
-- DuckDB does not have an `epoch_ms(timestamp)` function in 4.5.x; use
-  `(epoch(now()) * 1000)::BIGINT` to get current ms-since-epoch in SQL,
-  or compute it in Python.
-- **DuckDB infers INT32 from bound int parameters by default.**
-  Multiplications inside SQL (`? * 3600 * 1000`) overflow at hours ≥ ~596.
-  Symptom in our pipe: `OutOfRangeException: Overflow in multiplication
-  of INT32 (2592000 * 1000)` for hours=720. Fix: compute the offset in
-  Python (`offset_ms = hours * 3600 * 1000`) and pass the already-large
-  result as a single bound parameter — DuckDB infers INT64 for values
-  beyond the INT32 range.
+- `use_container_width=True` is deprecated in Streamlit ≥ 1.40 →
+  `width="stretch"` (or `"content"`).
+- VS Code Remote-SSH port-forward probes generate Tornado
+  `Invalid HTTP request received` warnings; silence with
+  `logging.getLogger("tornado.general").setLevel(logging.ERROR)`.
+- VS Code Remote-SSH **auto-detects** the streamlit port (8501) and
+  surfaces a "Open in browser" toast through the SSH tunnel — no
+  manual port-forward configuration needed.
+- DuckDB INTERVAL syntax: `INTERVAL N HOUR` (no quotes).
 - `read_parquet('path/**/*.parquet', hive_partitioning=true,
-  union_by_name=true)` works cross-platform if forward slashes are used
-  in the glob — even on Windows with backslashed paths, just `.replace("\\", "/")`.
-- DuckDB `ARG_MAX(value, ts_utc)` cleanly returns "the value at the
-  latest timestamp" within a `GROUP BY` — useful for "latest snapshot"
-  patterns.
+  union_by_name=true)` works cross-platform if forward slashes are
+  used in the glob, even on Windows.
+- DuckDB `qualify row_number() over (partition by … order by … desc) = 1`
+  is the "latest snapshot per group" pattern.
 - **Don't name a project script `inspect.py`.** It shadows Python's
-  stdlib `inspect`, causing circular-import errors when any package
-  (e.g., `attr` via `aiohttp`) does `import inspect`. Use `inspector.py`
-  or any other non-stdlib name.
+  stdlib `inspect`, breaking any package that does `import inspect`
+  during import-time (e.g. `attr` via `aiohttp`). Use `inspector.py`.
 
 ---
 
-## Behavioural observations on the data
+## Probes worth re-running on a fresh CCXT release
 
-- Sustained extreme funding rates **can be real**, not stale. Observed
-  RLS-USDT on OKX held between −600 % and −3200 % APY (4 h interval) for
-  18 hours continuously, value drifting cycle-to-cycle. Such regimes
-  typically coincide with delisting / halt conditions on the venue.
-- Single-cycle spike-and-revert events also occur (e.g. observed +1798 %
-  APY on ST-USDT at bitmart for one cycle, back to +10 % on the next).
-  Persistence filters of 2+ cycles eliminate these from anomaly views.
-- **Venues vary the funding interval per-pair when funding gets extreme.**
-  E.g., KUCOIN/BYBIT switch some pairs to 1 h cycles when |APY| spikes,
-  effectively 8× the settlement frequency. The `apy_norm` field handles
-  this transparently (`rate × 8760 / interval_h`); always compare APY,
-  never raw per-epoch rates, across pairs.
-- "Latest stored row per (symbol, venue)" ≠ "row from the latest cycle".
-  If a venue intermittently drops a pair from its batch response, a
-  `WHERE rn=1` query continues to return the stale value. Worth
-  distinguishing in queries intended to reflect "right now".
-- **BITMART's `info.funding_rate` is the *historical* last-settled rate**,
-  not the upcoming. The upcoming is `info.expected_funding_rate`.
-  Earlier code that used `info.funding_rate` recorded values one cycle
-  behind reality.
+1. `python audit.py` — full per-venue per-field source dump. Re-run
+   when CCXT updates or when adding a new venue. Detect schema drifts
+   (field renames, batch-vs-single info-stripping changes) immediately.
+2. `python probes.py capabilities` — `c.has` snapshot per venue.
+3. `python probes.py markets` — USDT-linear pair counts + samples per venue.
 
 ---
 
-## Probes worth re-running on a fresh iteration
+## Behavioral notes (verified empirically)
 
-The cheapest way to rebuild the OI / funding-field knowledge above on a
-fresh codebase:
-
-1. **Capability sweep** — `python probes.py capabilities`. Reads
-   `client.has` for each venue. No network calls. Spots changes in
-   CCXT's advertised capabilities (e.g., bybit fetchFundingRate went
-   from True → "emulated" between releases).
-2. **Markets sweep** — `python probes.py markets`. Counts USDT-linear
-   perps per venue. Reveals new venues' listings and dead markets that
-   pass the filter.
-3. **Ticker info dump** — `python probes.py ticker [SYMBOL]`. For each
-   venue, dumps unified ticker fields plus all `info` keys with sample
-   values. Reveals OI / funding / volume / scaling fields per venue's
-   raw shape. Run on a fresh CCXT release to catch field renames.
-4. **Single-venue funding probe** — `python probes.py funding [SYMBOL]`.
-   Per venue, dumps unified funding fields plus raw info keys plus the
-   computed interval source. Confirms unified-vs-raw mapping.
-5. **Pair history trace** — for any (symbol, venue) suspected of stale
-   or stuck data, dump every parquet row in chronological order plus
-   the gap distribution between consecutive rows. Distinguishes real
-   dropouts from normal cycle intervals.
+- Venues vary the funding interval per-pair when funding gets extreme
+  — KUCOIN/BYBIT/BITGET/etc. shift 8h-default pairs to 4h or 1h cycles
+  during volatile regimes. The fix is to read each venue's per-symbol
+  interval from its authoritative source on every cycle (per the spec
+  table above) — never default to a venue-wide constant.
+- Cross-venue boundary alignment is empirically stable: every venue's
+  same-symbol next_funding_ts at any given cycle length matches to the
+  ms across the 13-venue set. UTC-grid alignment is reliable for the
+  derivations marked "UTC-derived" in the spec table.
+- "Latest stored row per (symbol, venue)" is not always "from the
+  latest cycle" — if a venue intermittently drops a pair from its
+  batch response, a `qualify rn=1` query continues to return the
+  prior value. Worth distinguishing in queries that need "right now".

@@ -9,12 +9,13 @@ VS Code Remote-SSH auto-detects the listening port (default 8501) and
 surfaces a 'Open in browser' toast that opens it through the SSH tunnel.
 
 Refresh mechanics:
-  - Header (top metrics + freshness dot) auto-reruns every 15 s.
-  - Each tab's data tables auto-rerun every 30 s via st.fragment.
+  - Header (top metrics + freshness dot) auto-reruns every 10 s.
+  - Each tab's data tables auto-rerun every 10 s via st.fragment.
   - Filter widgets are OUTSIDE the fragments — typing in a number_input
     doesn't get clobbered by an auto-rerun.
-  - Underlying queries are @st.cache_data(ttl=30); the fragment rerun
-    races the cache TTL so a fresh query happens roughly every 30 s.
+  - Underlying queries are @st.cache_data(ttl=10); the fragment rerun
+    races the cache TTL so a fresh query happens roughly every 10 s.
+  - End-to-end disk-write → display latency: ~10 s typical.
 
 Rate semantics (display labels mirror SCHEMA in collector.py):
   - "Rate (next epoch)"      = upcoming-boundary rate (B), what trades
@@ -61,7 +62,7 @@ def _db():
     return db
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def _latest_snapshot() -> pd.DataFrame:
     """One row per (exchange, symbol_canonical) — most recent observation,
     with global oi_rank descending by open_interest_usd. Null OI sorts to
@@ -80,7 +81,7 @@ def _latest_snapshot() -> pd.DataFrame:
     """).df()
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def _history(symbol: str, hours: int) -> pd.DataFrame:
     # Compute the offset in Python: hours * 3600 * 1000 overflows DuckDB's
     # INT32 inference at hours >= ~596 (720 was the trigger seen in the
@@ -114,10 +115,10 @@ def _add_countdown(df: pd.DataFrame, now_ms: int) -> pd.DataFrame:
 
 
 def _freshness_dot(age_s: float) -> str:
-    """🟢 fresh (within ~2 cycles), 🟡 missed one, 🔴 stale."""
-    if age_s < 120:
+    """🟢 fresh (within ~2 cycles at 30 s cadence), 🟡 missed one, 🔴 stale."""
+    if age_s < 60:
         return "🟢"
-    if age_s < 240:
+    if age_s < 120:
         return "🟡"
     return "🔴"
 
@@ -260,7 +261,7 @@ def _apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
 # auto-refreshing fragments
 # --------------------------------------------------------------------------
 
-@st.fragment(run_every=15)
+@st.fragment(run_every=10)
 def render_header():
     snapshot = _latest_snapshot()
     if snapshot.empty:
@@ -281,7 +282,7 @@ def render_header():
         st.rerun()
 
 
-@st.fragment(run_every=30)
+@st.fragment(run_every=10)
 def render_anomalies():
     snapshot = _latest_snapshot()
     if snapshot.empty:
@@ -313,7 +314,7 @@ def render_anomalies():
     )
 
 
-@st.fragment(run_every=30)
+@st.fragment(run_every=10)
 def render_spreads():
     snapshot = _latest_snapshot()
     if snapshot.empty:

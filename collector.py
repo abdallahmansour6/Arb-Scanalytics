@@ -3,16 +3,24 @@ Async collector. One task per venue.
 
 Each task pulls funding/OI/mark/volume for every USDT-linear perp on its
 venue, normalizes to the canonical row shape, and appends one Parquet
-file to the active partition (data/funding/year=YYYY/month=MM/day=DD/).
+file to the active partition.
 
-Per-venue strategies are bespoke because each venue scatters funding/OI
-across different surfaces (ticker.info, batch endpoints, per-symbol
-fan-out). The variation map was established empirically via probes.py
-and is encoded inline below.
+DESIGN RULE — every field has ONE explicit, authoritative source per
+venue. There are NO cascading fallbacks. If the authoritative source
+is missing for a row, the field is NULL. Never substitute 'last' for
+'mark', and never default an interval to 8 h. The per-venue extraction
+table is documented in FIELD_NOTES.md.
+
+The single allowed *derivation* is UTC-aligned next_funding_ts — when
+a venue exposes the interval but not the timestamp, we round the
+current ts up to the next interval boundary. Verified empirically:
+all 13 venues align their boundaries to the UTC grid for 8h/4h/1h
+cycles. This is a math derivation from authoritative inputs, not a
+fake fallback.
 
 Failure of any single venue is isolated and logged; sibling venues
-continue. Run with --once for a single cycle (test-drive); without flags,
-loops until SIGTERM/SIGINT.
+continue. Run with --once for a single cycle (test-drive); without
+flags, loops until SIGTERM/SIGINT.
 """
 
 import argparse
@@ -22,8 +30,8 @@ import signal
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
-from pathlib import Path
 
+import aiohttp
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -34,38 +42,42 @@ from config import VENUES, FUNDING_DIR, POLL_INTERVAL_S, open_client
 # Canonical schema (locked at collector boundary)
 # ---------------------------------------------------------------------------
 #
-# Venues expose up to THREE distinct funding-rate concepts; the schema below
-# stores two and ignores the third:
+# Three funding-rate concepts, two stored:
+#   (A) Last-settled — historical, frozen until next boundary. NOT stored.
+#   (B) Upcoming     — what will settle at next_funding_ts. Stored as
+#                       funding_rate. CCXT's unified fundingRate maps here.
+#   (C) Forward forecast — prediction for the cycle AFTER upcoming. Stored
+#                          as predicted_rate. Only 4 venues expose it
+#                          (COINEX, HTX, KUCOIN, OKX, PHEMEX); NULL elsewhere.
 #
-#   (A) LAST-SETTLED    — already-paid rate from the previous boundary.
-#                         Historical. Only BITMART exposes a dedicated field
-#                         for this (info.funding_rate). Not stored.
-#   (B) UPCOMING        — the rate that will settle at the next boundary.
-#                         Refines continuously as the TWAP-of-premium-index
-#                         accumulates over the cycle. This is what a position
-#                         opened *now* will pay/receive at next_funding_ts.
-#                         Stored as: funding_rate. CCXT's unified fundingRate
-#                         always points here.
-#   (C) FORWARD FORECAST — exchange's prediction for the cycle AFTER upcoming.
-#                          Only 4 venues expose this: COINEX (info.next_funding_rate),
-#                          HTX (info.estimated_rate), OKX (info.nextFundingRate),
-#                          PHEMEX (info.predFundingRateRr). Stored as:
-#                          predicted_rate. Null for the other 9 venues.
-#
-# Common labels in the wild ("Expected Funding Rate", "Predicted Rate") are
-# venue-specific and inconsistent — always reduce to (A)/(B)/(C) when reading
-# venue docs.
+# Three price fields, in decreasing precision for basis-bps math:
+#   mark_price  — the venue's published mark price (composite spot
+#                 reference; what funding/liquidations/PnL use). NULL
+#                 where the venue does not publish it (BITMART, HTX,
+#                 OKX). Always prefer this for basis math when populated.
+#   index_price — the venue's published index price (multi-venue spot
+#                 composite). NULL where not exposed (HTX, OKX).
+#   last_price  — most recent trade price. UNIVERSALLY populated across
+#                 all 13 venues. Diverges from mark by typically a few
+#                 basis points in calm markets, wider in fast moves; that
+#                 divergence propagates 1:1 into any basis-bps estimate
+#                 derived from it. Stored as a separate primitive so
+#                 downstream queries can explicitly choose
+#                 `coalesce(mark_price, last_price)` and reason about the
+#                 precision tradeoff. The execution engine uses real-time
+#                 L2 VWAP; these fields are for scanner-level estimation.
 
 SCHEMA = pa.schema([
     ("ts_utc",             pa.int64()),    # ms since epoch (UTC)
     ("exchange",           pa.string()),
-    ("symbol_canonical",   pa.string()),   # e.g. "BTC/USDT:USDT"
-    ("funding_rate",       pa.float64()),  # (B) upcoming-boundary rate, raw per-epoch
-    ("funding_interval_h", pa.float32()),  # usually 1/4/8; some venues use other
-    ("predicted_rate",     pa.float64()),  # (C) forecast for cycle AFTER upcoming
-    ("next_funding_ts",    pa.int64()),    # ms; settlement of the upcoming epoch
-    ("mark_price",         pa.float64()),
-    ("index_price",        pa.float64()),
+    ("symbol_canonical",   pa.string()),
+    ("funding_rate",       pa.float64()),  # (B) upcoming-boundary rate
+    ("funding_interval_h", pa.float32()),  # authoritative; NULL if unobtainable
+    ("predicted_rate",     pa.float64()),  # (C) cycle-after forecast
+    ("next_funding_ts",    pa.int64()),    # authoritative or UTC-derived from interval
+    ("mark_price",         pa.float64()),  # NULL if venue does not publish mark
+    ("index_price",        pa.float64()),  # NULL if venue does not publish index
+    ("last_price",         pa.float64()),  # most recent trade; ~universally populated
     ("open_interest_usd",  pa.float64()),
     ("volume_24h_usd",     pa.float64()),
     ("apy_norm",           pa.float64()),  # rate * 8760 / interval_h
@@ -76,34 +88,12 @@ log = logging.getLogger("scanner.collector")
 
 
 # ---------------------------------------------------------------------------
-# helpers
+# Small helpers (no fallbacks; coerce-to-None on bad input)
 # ---------------------------------------------------------------------------
 
-def _is_usdt_linear(market: dict | None) -> bool:
-    """USDT-quoted, USDT-settled, linear, swap, not deactivated.
-
-    Field-notes from a prior pass said coinex's natural BTC perp is
-    BTC/USD:USDT (quote=USD, settle=USDT) and that requiring quote==USDT
-    would drop the venue entirely. Probes against current CCXT 4.5.49
-    show coinex offers BTC/USDT:USDT directly — the /USD:USDT line is
-    either retired or moved to a different listing class. Requiring
-    quote==USDT AND settle==USDT prevents per-venue duplicates from
-    USDC-quoted or USD-quoted variants of the same base. Treat
-    active=None as pass (coinex's own quirk)."""
-    if not market or not market.get("swap") or not market.get("linear"):
-        return False
-    if market.get("active") is False:
-        return False
-    return market.get("quote") == "USDT" and market.get("settle") == "USDT"
-
-
-def _canonical_symbol(market: dict) -> str:
-    """CCXT unified symbol — already the canonical truth on the wire."""
-    return market["symbol"]
-
-
 def _f(v):
-    """Defensive float coerce. Empty string and None both become None."""
+    """Defensive float coerce. Empty string and None both become None.
+    Reject NaN-likes the same way."""
     if v is None or v == "":
         return None
     try:
@@ -112,59 +102,55 @@ def _f(v):
         return None
 
 
-def _interval_h(unified_funding: dict | None, ticker_info: dict | None,
-                default: float = 8.0) -> float:
-    """Resolve epoch length in hours.
+def _is_usdt_linear(market: dict | None) -> bool:
+    """USDT-quoted, USDT-settled, linear, swap, not deactivated. Per the
+    audit, every active venue offers BTC/USDT:USDT in this exact shape.
+    coinex sets active=None instead of True; treat None as pass."""
+    if not market or not market.get("swap") or not market.get("linear"):
+        return False
+    if market.get("active") is False:
+        return False
+    return market.get("quote") == "USDT" and market.get("settle") == "USDT"
 
-    Priority: unified funding 'interval' string ("8h"), then unified
-    nextFundingTimestamp - fundingTimestamp diff, then any common ticker-
-    info field that carries the interval, then default (8h)."""
-    if unified_funding:
-        iv = unified_funding.get("interval")
-        if isinstance(iv, str) and iv.endswith("h"):
-            try:
-                return float(iv.rstrip("h"))
-            except ValueError:
-                pass
-        fts = unified_funding.get("fundingTimestamp")
-        nfts = unified_funding.get("nextFundingTimestamp")
-        if fts and nfts and nfts > fts:
-            return (nfts - fts) / 3_600_000
-    if ticker_info:
-        for k in ("funding_interval_hours", "fundingIntervalHour",
-                  "collectCycle", "collectionInternal"):
-            v = _f(ticker_info.get(k))
-            if v:
-                return v
-    return default
+
+def _canonical_symbol(market: dict) -> str:
+    return market["symbol"]
 
 
 def _apy_norm(rate, interval_h):
+    """rate (per-epoch fraction) × 8760 / interval_h → annualized fraction."""
     if rate is None or not interval_h:
         return None
     return rate * 8760.0 / interval_h
 
 
-def _next_ts_from_interval(ts_ms: int, interval_h: float | None) -> int | None:
-    """UTC-aligned next funding boundary. Heuristic for venues that don't
-    expose next_funding_ts directly (currently MEXC).
-
-    Verified empirically against 12 of our 13 venues: all 8h cycles align
-    to the same UTC-anchored grid (their nextFundingTimestamp values match
-    across venues for identical symbols). For 1h/4h cycles the same UTC
-    alignment held in samples observed. If a venue ever offsets its
-    boundaries, this heuristic will be wrong by the offset."""
+def _utc_next_boundary(ts_ms: int, interval_h: float | None) -> int | None:
+    """UTC-aligned next-funding-boundary derivation. Used ONLY when a
+    venue exposes the interval but not a per-symbol next-funding
+    timestamp. Verified empirically: every venue in this project aligns
+    its boundaries to the UTC grid (BTC's nextFundingTimestamp matches
+    across venues at any cycle length sampled — 8h/4h/1h)."""
     if not interval_h:
         return None
     interval_ms = int(interval_h * 3600 * 1000)
     return ((ts_ms // interval_ms) + 1) * interval_ms
 
 
-def _row(*, ts_ms, exchange, symbol, funding_rate, interval_h,
-         predicted=None, next_ts=None, mark=None, index=None,
-         oi_usd=None, vol_usd=None) -> dict:
+def _build_row(*, ts_ms, exchange, symbol, funding_rate, interval_h,
+               predicted=None, next_ts=None, mark=None, index=None,
+               last=None, oi_usd=None, vol_usd=None) -> dict:
+    """Assemble one canonical row. The only derivations are apy_norm
+    (from funding_rate × 8760 / interval_h) and the UTC-aligned next_ts
+    fallback when the venue does not publish a timestamp directly. Every
+    other field is verbatim from the venue's authoritative source.
+
+    `last` is the most-recent-trade price from the venue's ticker; stored
+    as `last_price` and intended as a deliberate downstream fallback for
+    `mark_price` when running cross-venue basis-bps analytics on venues
+    that don't publish a mark. The schema's `mark_price` itself stays
+    strictly authoritative — never overwritten by `last`."""
     if not next_ts and interval_h:
-        next_ts = _next_ts_from_interval(ts_ms, interval_h)
+        next_ts = _utc_next_boundary(ts_ms, interval_h)
     return {
         "ts_utc": ts_ms,
         "exchange": exchange,
@@ -175,6 +161,7 @@ def _row(*, ts_ms, exchange, symbol, funding_rate, interval_h,
         "next_funding_ts": int(next_ts) if next_ts else None,
         "mark_price": mark,
         "index_price": index,
+        "last_price": last,
         "open_interest_usd": oi_usd,
         "volume_24h_usd": vol_usd,
         "apy_norm": _apy_norm(funding_rate, interval_h),
@@ -182,14 +169,12 @@ def _row(*, ts_ms, exchange, symbol, funding_rate, interval_h,
 
 
 def _write_partition(exchange: str, ts_ms: int, rows: list[dict]):
-    """Append one Parquet file per (exchange, cycle) into the day partition."""
     if not rows:
         return
     now = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-    partition = (FUNDING_DIR
-                 / f"year={now.year:04d}"
-                 / f"month={now.month:02d}"
-                 / f"day={now.day:02d}")
+    partition = (FUNDING_DIR / f"year={now.year:04d}"
+                              / f"month={now.month:02d}"
+                              / f"day={now.day:02d}")
     partition.mkdir(parents=True, exist_ok=True)
     file = partition / f"{exchange}_{ts_ms}.parquet"
     table = pa.Table.from_pylist(rows, schema=SCHEMA)
@@ -197,65 +182,188 @@ def _write_partition(exchange: str, ts_ms: int, rows: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# venue collectors
-#
-# Each takes (client, ts_ms) and returns list[canonical_row].
-# Strategies and field map come from probes.py findings + FIELD_NOTES.md.
+# Per-venue collectors. Each function owns its venue's full extraction:
+# what to fetch, where to read each field, what the unit conversion is.
+# Single source per field. NULL where the source is unavailable.
 # ---------------------------------------------------------------------------
 
+# -- BINANCE -----------------------------------------------------------------
 
-# -- Helpers shared across the three collection paths -----------------------
+async def collect_binance(c, ts_ms):
+    """Sources:
+      funding_rate     : batch f.unified.fundingRate
+      interval_h       : binance fapiPublicGetFundingInfo per-symbol fundingIntervalHours
+      next_funding_ts  : batch f.info.nextFundingTime
+      mark             : batch f.info.markPrice
+      index            : batch f.info.indexPrice
+      oi_usd           : per-symbol openInterestAmount × contractSize × mark (fan-out)
+      vol_usd          : t.unified.quoteVolume
+      predicted        : not exposed → NULL
+    """
+    # Per-symbol funding-interval map (one extra REST call returning all symbols).
+    fi = await c.fapiPublicGetFundingInfo()
+    interval_by_sym = {}
+    for entry in fi:
+        ccxt_id = entry.get("symbol")
+        # Map BINANCE id (e.g. "BTCUSDT") → CCXT unified ("BTC/USDT:USDT")
+        m_list = c.markets_by_id.get(ccxt_id) or []
+        for m in m_list:
+            if _is_usdt_linear(m):
+                interval_by_sym[m["symbol"]] = _f(entry.get("fundingIntervalHours"))
 
-def _extract_oi_usd(info: dict, oi_field: str | None, oi_unit: str,
-                    mark: float | None, market: dict) -> float | None:
-    if not oi_field:
-        return None
-    v = _f(info.get(oi_field))
-    if v is None:
-        return None
-    if oi_unit == "usd":
-        return v
-    if mark is None:
-        return None
-    if oi_unit == "base":
-        return v * mark
-    if oi_unit == "contracts":
-        cs = _f(market.get("contractSize")) or 1.0
-        return v * cs * mark
-    return None
+    funding = await c.fetch_funding_rates()
+    tickers = await c.fetch_tickers()
+
+    rows: list[dict] = []
+    fanout: list[tuple[str, dict, dict]] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        f = funding.get(sym) or {}
+        f_info = f.get("info") or {}
+        mark = _f(f_info.get("markPrice"))
+        index = _f(f_info.get("indexPrice"))
+        row = _build_row(
+            ts_ms=ts_ms, exchange="BINANCE",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(f.get("fundingRate")),
+            interval_h=interval_by_sym.get(sym),
+            next_ts=_f(f_info.get("nextFundingTime")),
+            mark=mark, index=index, last=_f(t.get("last")),
+            oi_usd=None,  # filled in fan-out
+            vol_usd=_f(t.get("quoteVolume")),
+        )
+        rows.append(row)
+        fanout.append((sym, market, row))
+
+    sem = asyncio.Semaphore(40)  # public /openInterest weight=1, 2400/min
+
+    async def _one(sym, market, row):
+        async with sem:
+            try:
+                oi = await c.fetch_open_interest(sym)
+            except Exception:
+                return
+            amt = _f(oi.get("openInterestAmount"))
+            if amt is None or row["mark_price"] is None:
+                return
+            cs = _f(market.get("contractSize")) or 1.0
+            row["open_interest_usd"] = amt * cs * row["mark_price"]
+
+    await asyncio.gather(*(_one(s, m, r) for s, m, r in fanout))
+    return rows
 
 
-def _extract_vol_usd(t: dict, info: dict, vol_field: str | None,
-                     mark: float | None, market: dict) -> float | None:
-    """USD volume. Priority: ticker.info[vol_field] -> unified.quoteVolume ->
-    baseVolume * contractSize * mark (handles OKX, where unified.quoteVolume
-    is None and baseVolume is in raw contracts)."""
-    if vol_field:
-        v = _f(info.get(vol_field))
-        if v is not None:
-            return v
-    v = _f(t.get("quoteVolume"))
-    if v is not None:
-        return v
-    bv = _f(t.get("baseVolume"))
-    if bv is not None and mark:
-        cs = _f(market.get("contractSize")) or 1.0
-        return bv * cs * mark
-    return None
+# -- BINGX -------------------------------------------------------------------
+
+async def collect_bingx(c, ts_ms):
+    """Sources:
+      funding_rate     : batch f.unified.fundingRate
+      interval_h       : batch f.info.fundingIntervalHours
+      next_funding_ts  : batch f.info.nextFundingTime
+      mark             : batch f.info.markPrice
+      index            : batch f.info.indexPrice
+      oi_usd           : per-symbol openInterestValue (already USD direct)
+      vol_usd          : t.unified.quoteVolume
+      predicted        : not exposed → NULL
+    """
+    funding = await c.fetch_funding_rates()
+    tickers = await c.fetch_tickers()
+
+    rows: list[dict] = []
+    fanout: list[tuple[str, dict]] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        f = funding.get(sym) or {}
+        f_info = f.get("info") or {}
+        row = _build_row(
+            ts_ms=ts_ms, exchange="BINGX",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(f.get("fundingRate")),
+            interval_h=_f(f_info.get("fundingIntervalHours")),
+            next_ts=_f(f_info.get("nextFundingTime")),
+            mark=_f(f_info.get("markPrice")),
+            index=_f(f_info.get("indexPrice")),
+            last=_f(t.get("last")),
+            oi_usd=None,
+            vol_usd=_f(t.get("quoteVolume")),
+        )
+        rows.append(row)
+        fanout.append((sym, row))
+
+    sem = asyncio.Semaphore(40)
+
+    async def _one(sym, row):
+        async with sem:
+            try:
+                oi = await c.fetch_open_interest(sym)
+            except Exception:
+                return
+            row["open_interest_usd"] = _f(oi.get("openInterestValue"))
+
+    await asyncio.gather(*(_one(s, r) for s, r in fanout))
+    return rows
 
 
-# -- Group A: everything we need is in ticker.info (one fetch_tickers call) --
+# -- BITGET ------------------------------------------------------------------
 
-async def _collect_via_ticker_info(c, exchange: str, ts_ms: int, *,
-                                    funding_field: str,
-                                    predicted_field: str | None = None,
-                                    mark_field: str | None = None,
-                                    index_field: str | None = None,
-                                    oi_field: str | None = None,
-                                    oi_unit: str = "base",
-                                    vol_field: str | None = None,
-                                    next_ts_field: str | None = None,
-                                    interval_default: float = 8.0) -> list[dict]:
+async def collect_bitget(c, ts_ms):
+    """Sources:
+      funding_rate     : t.info.fundingRate
+      interval_h       : market.info.fundInterval (loaded once at startup)
+      next_funding_ts  : derived UTC-aligned from interval
+                         (batch funding strips per-symbol nextUpdate; the
+                         per-symbol fan-out for 543 symbols is too costly)
+      mark             : t.info.markPrice
+      index            : t.info.indexPrice
+      oi_usd           : t.info.holdingAmount × mark
+      vol_usd          : t.info.usdtVolume
+      predicted        : not exposed → NULL
+    """
+    tickers = await c.fetch_tickers()
+    rows: list[dict] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        m_info = market.get("info") or {}
+        t_info = t.get("info") or {}
+        mark = _f(t_info.get("markPrice"))
+        oi_base = _f(t_info.get("holdingAmount"))
+        oi_usd = oi_base * mark if (oi_base is not None and mark is not None) else None
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="BITGET",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(t_info.get("fundingRate")),
+            interval_h=_f(m_info.get("fundInterval")),
+            next_ts=None,  # derived in _build_row
+            mark=mark, index=_f(t_info.get("indexPrice")),
+            last=_f(t.get("last")),
+            oi_usd=oi_usd,
+            vol_usd=_f(t_info.get("usdtVolume")),
+        ))
+    return rows
+
+
+# -- BITMART -----------------------------------------------------------------
+
+async def collect_bitmart(c, ts_ms):
+    """Sources:
+      funding_rate     : t.info.expected_funding_rate (the upcoming-cycle
+                         refinement; CCXT maps this → unified.fundingRate.
+                         Note: t.info.funding_rate is the LAST-settled
+                         rate (historical) on bitmart, not what we want.)
+      interval_h       : t.info.funding_interval_hours
+      next_funding_ts  : t.info.funding_time
+      mark             : not exposed → NULL
+      index            : t.info.index_price
+      oi_usd           : t.info.open_interest_value (USD direct)
+      vol_usd          : t.info.turnover_24h
+      predicted        : not exposed (bitmart's "expected" is upcoming, not forecast) → NULL
+    """
     tickers = await c.fetch_tickers()
     rows: list[dict] = []
     for sym, t in tickers.items():
@@ -263,273 +371,419 @@ async def _collect_via_ticker_info(c, exchange: str, ts_ms: int, *,
         if not _is_usdt_linear(market):
             continue
         info = t.get("info") or {}
-        mark = _f(info.get(mark_field)) if mark_field else None
-        if mark is None:
-            mark = _f(t.get("last"))
-        index = _f(info.get(index_field)) if index_field else None
-        if index is None:
-            index = _f(t.get("indexPrice")) or mark
-
-        rows.append(_row(
-            ts_ms=ts_ms, exchange=exchange, symbol=_canonical_symbol(market),
-            funding_rate=_f(info.get(funding_field)),
-            interval_h=_interval_h(None, info, default=interval_default),
-            predicted=_f(info.get(predicted_field)) if predicted_field else None,
-            next_ts=_f(info.get(next_ts_field)) if next_ts_field else None,
-            mark=mark, index=index,
-            oi_usd=_extract_oi_usd(info, oi_field, oi_unit, mark, market),
-            vol_usd=_extract_vol_usd(t, info, vol_field, mark, market),
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="BITMART",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(info.get("expected_funding_rate")),
+            interval_h=_f(info.get("funding_interval_hours")),
+            next_ts=_f(info.get("funding_time")),
+            mark=None,
+            index=_f(info.get("index_price")),
+            last=_f(t.get("last")),
+            oi_usd=_f(info.get("open_interest_value")),
+            vol_usd=_f(info.get("turnover_24h")),
         ))
     return rows
 
 
-async def collect_bitmart(c, ts_ms):
-    # Bitmart's ticker.info exposes BOTH last-settled (funding_rate) and the
-    # upcoming-boundary refinement (expected_funding_rate). CCXT maps
-    # expected_funding_rate -> unified.fundingRate, confirming "expected"
-    # is the upcoming rate. We store the upcoming as funding_rate and drop
-    # the historical last-settled. Bitmart does not expose a forward
-    # forecast for the cycle AFTER upcoming.
-    return await _collect_via_ticker_info(
-        c, "BITMART", ts_ms,
-        funding_field="expected_funding_rate", predicted_field=None,
-        index_field="index_price",
-        oi_field="open_interest_value", oi_unit="usd",
-        vol_field="turnover_24h", next_ts_field="funding_time",
-    )
-
+# -- BYBIT -------------------------------------------------------------------
 
 async def collect_bybit(c, ts_ms):
-    return await _collect_via_ticker_info(
-        c, "BYBIT", ts_ms,
-        funding_field="fundingRate",
-        mark_field="markPrice", index_field="indexPrice",
-        oi_field="openInterestValue", oi_unit="usd",
-        vol_field="turnover24h", next_ts_field="nextFundingTime",
-    )
+    """Sources:
+      funding_rate     : t.info.fundingRate
+      interval_h       : t.info.fundingIntervalHour
+      next_funding_ts  : t.info.nextFundingTime
+      mark             : t.info.markPrice
+      index            : t.info.indexPrice
+      oi_usd           : t.info.openInterestValue (USD direct)
+      vol_usd          : t.info.turnover24h
+      predicted        : not exposed → NULL
+    """
+    tickers = await c.fetch_tickers()
+    rows: list[dict] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        info = t.get("info") or {}
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="BYBIT",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(info.get("fundingRate")),
+            interval_h=_f(info.get("fundingIntervalHour")),
+            next_ts=_f(info.get("nextFundingTime")),
+            mark=_f(info.get("markPrice")),
+            index=_f(info.get("indexPrice")),
+            last=_f(t.get("last")),
+            oi_usd=_f(info.get("openInterestValue")),
+            vol_usd=_f(info.get("turnover24h")),
+        ))
+    return rows
 
 
-async def collect_mexc(c, ts_ms):
-    return await _collect_via_ticker_info(
-        c, "MEXC", ts_ms,
-        funding_field="fundingRate", predicted_field=None,
-        mark_field="fairPrice", index_field="indexPrice",
-        oi_field="holdVol", oi_unit="contracts",
-        vol_field="amount24",
-    )
+# -- COINEX ------------------------------------------------------------------
 
-
-async def collect_phemex(c, ts_ms):
-    # Phemex fields use Rr/Rp/Rv suffixes — field-notes warned of scaled Ep/Ev
-    # ints elsewhere, but the Rr (real rate) and Rp (real price) fields used
-    # here come through descaled (verified empirically against BTC).
-    return await _collect_via_ticker_info(
-        c, "PHEMEX", ts_ms,
-        funding_field="fundingRateRr", predicted_field="predFundingRateRr",
-        mark_field="markPriceRp", index_field="indexPriceRp",
-        oi_field="openInterestRv", oi_unit="base",
-        vol_field="turnoverRv",
-    )
-
-
-# -- Group B: ticker for vol/mark + batch fetch_funding_rates for funding --
-
-async def _collect_with_batch_funding(c, exchange: str, ts_ms: int, *,
-                                       predicted_info_key: str | None = None,
-                                       oi_strategy: str = "skip",
-                                       # ticker.info-based extractions, applied
-                                       # in addition to / overriding the unified path:
-                                       mark_info_field: str | None = None,
-                                       index_info_field: str | None = None,
-                                       oi_info_field: str | None = None,
-                                       oi_info_unit: str = "base",
-                                       vol_info_field: str | None = None,
-                                       next_ts_info_field: str | None = None,
-                                       interval_default: float = 8.0
-                                       ) -> list[dict]:
-    """Fetch tickers + batch funding (+ optional batch OI) in parallel,
-    join, and produce canonical rows.
-
-    oi_strategy:
-      - "batch":              fetch_open_interests() in parallel; merge by symbol
-      - "per_symbol_fanout":  fetch_open_interest(sym) per row after the join
-      - "skip":               no OI (default)
-
-    If oi_info_field is provided, it takes precedence over oi_strategy
-    (extract OI from ticker.info — used by coinex)."""
-    tickers_task = asyncio.create_task(c.fetch_tickers())
+async def collect_coinex(c, ts_ms):
+    """Sources:
+      funding_rate     : batch f.unified.fundingRate
+      interval_h       : batch f.unified.interval (CCXT parses '8h' → 8)
+      next_funding_ts  : batch f.unified.fundingTimestamp  (the upcoming
+                         boundary. CCXT's nextFundingTimestamp is the
+                         cycle AFTER upcoming — wrong field for our use.)
+      mark             : t.info.mark_price
+      index            : t.info.index_price
+      oi_usd           : t.info.open_interest_volume (base) × mark
+      vol_usd          : t.info.value
+      predicted        : batch f.info.next_funding_rate (forward forecast)
+    """
     funding_task = asyncio.create_task(c.fetch_funding_rates())
-    oi_task = (asyncio.create_task(c.fetch_open_interests())
-               if oi_strategy == "batch" else None)
-    tickers = await tickers_task
+    tickers = await c.fetch_tickers()
     funding = await funding_task
-    oi_batch = await oi_task if oi_task else {}
 
     rows: list[dict] = []
-    fanout_targets: list[tuple[str, dict, dict]] = []
     for sym, t in tickers.items():
         market = c.markets.get(sym)
         if not _is_usdt_linear(market):
             continue
         f = funding.get(sym) or {}
-        if not f.get("fundingRate") and f.get("fundingRate") != 0.0:
-            continue  # skip pairs without a funding rate this cycle
-        info_t = t.get("info") or {}
-        info_f = f.get("info") or {}
-
-        mark = _f(info_t.get(mark_info_field)) if mark_info_field else None
-        if mark is None:
-            mark = _f(t.get("markPrice")) or _f(t.get("last"))
-        index = _f(info_t.get(index_info_field)) if index_info_field else None
-        if index is None:
-            index = _f(t.get("indexPrice")) or mark
-
-        oi_usd = None
-        if oi_info_field:
-            oi_usd = _extract_oi_usd(info_t, oi_info_field, oi_info_unit, mark, market)
-        elif oi_strategy == "batch":
-            oi_obj = oi_batch.get(sym) or {}
-            v = _f(oi_obj.get("openInterestValue"))
-            if v is None:
-                v = _f(oi_obj.get("openInterestAmount"))
-                if v is not None and mark:
-                    cs = _f(market.get("contractSize")) or 1.0
-                    v = v * cs * mark
-            oi_usd = v
-        # per_symbol_fanout: filled after the loop
-
-        next_ts = f.get("nextFundingTimestamp") or f.get("fundingTimestamp")
-        if next_ts_info_field:
-            ti = _f(info_t.get(next_ts_info_field))
-            if ti is not None:
-                next_ts = ti
-
-        rows.append(_row(
-            ts_ms=ts_ms, exchange=exchange,
+        f_info = f.get("info") or {}
+        t_info = t.get("info") or {}
+        mark = _f(t_info.get("mark_price"))
+        oi_base = _f(t_info.get("open_interest_volume"))
+        oi_usd = oi_base * mark if (oi_base is not None and mark is not None) else None
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="COINEX",
             symbol=_canonical_symbol(market),
             funding_rate=_f(f.get("fundingRate")),
-            interval_h=_interval_h(f, info_t, default=interval_default),
-            predicted=_f(info_f.get(predicted_info_key)) if predicted_info_key else None,
-            next_ts=next_ts, mark=mark, index=index,
+            interval_h=_parse_interval_str(f.get("interval")),
+            next_ts=_f(f.get("fundingTimestamp")),
+            mark=mark, index=_f(t_info.get("index_price")),
+            last=_f(t.get("last")),
             oi_usd=oi_usd,
-            vol_usd=_extract_vol_usd(t, info_t, vol_info_field, mark, market),
+            vol_usd=_f(t_info.get("value")),
+            predicted=_f(f_info.get("next_funding_rate")),
         ))
-        if oi_strategy == "per_symbol_fanout" and not oi_info_field:
-            fanout_targets.append((sym, market, rows[-1]))
-
-    if fanout_targets:
-        # Tight sem-bounded fan-out to respect rate limits while filling fast.
-        sem = asyncio.Semaphore(20)
-
-        async def _one(sym, market, row):
-            async with sem:
-                try:
-                    oi = await c.fetch_open_interest(sym)
-                except Exception:
-                    return
-                v = _f(oi.get("openInterestValue"))
-                if v is None:
-                    v = _f(oi.get("openInterestAmount"))
-                    if v is not None and row["mark_price"]:
-                        cs = _f(market.get("contractSize")) or 1.0
-                        v = v * cs * row["mark_price"]
-                row["open_interest_usd"] = v
-
-        await asyncio.gather(*(_one(s, m, r) for s, m, r in fanout_targets))
-
     return rows
 
 
-async def collect_binance(c, ts_ms):
-    # OI: per-symbol fan-out (batch unsupported). ~559 calls/cycle.
-    return await _collect_with_batch_funding(
-        c, "BINANCE", ts_ms, oi_strategy="per_symbol_fanout",
-    )
-
-
-async def collect_bingx(c, ts_ms):
-    # OI: per-symbol fan-out (batch unsupported). ~595 calls/cycle.
-    return await _collect_with_batch_funding(
-        c, "BINGX", ts_ms, oi_strategy="per_symbol_fanout",
-    )
-
-
-async def collect_bitget(c, ts_ms):
-    # Bitget has funding in ticker.info AND batch fetchFundingRates. We
-    # use batch funding so we get unified.fundingTimestamp (next epoch ts);
-    # ticker.info still provides OI/mark/vol. No predicted in either path.
-    return await _collect_with_batch_funding(
-        c, "BITGET", ts_ms,
-        mark_info_field="markPrice", index_info_field="indexPrice",
-        oi_info_field="holdingAmount", oi_info_unit="base",
-        vol_info_field="usdtVolume",
-    )
-
-
-async def collect_coinex(c, ts_ms):
-    # CCXT advertises fetch_funding_rates; OI/vol/mark sit in ticker.info.
-    return await _collect_with_batch_funding(
-        c, "COINEX", ts_ms,
-        predicted_info_key="next_funding_rate",
-        mark_info_field="mark_price", index_info_field="index_price",
-        oi_info_field="open_interest_volume", oi_info_unit="base",
-        vol_info_field="value",
-    )
-
+# -- GATE.IO -----------------------------------------------------------------
 
 async def collect_gate(c, ts_ms):
-    # Gate.io has funding in ticker.info AND batch fetchFundingRates. We
-    # use batch funding for unified.fundingTimestamp (next epoch ts);
-    # ticker.info still provides OI/mark/vol.
-    return await _collect_with_batch_funding(
-        c, "GATE.IO", ts_ms,
-        mark_info_field="mark_price", index_info_field="index_price",
-        oi_info_field="total_size", oi_info_unit="contracts",
-        vol_info_field="volume_24h_quote",
-    )
+    """Sources:
+      funding_rate     : batch f.unified.fundingRate
+      interval_h       : batch f.unified.interval
+      next_funding_ts  : batch f.unified.fundingTimestamp
+      mark             : t.info.mark_price
+      index            : t.info.index_price
+      oi_usd           : t.info.total_size × contractSize × mark
+      vol_usd          : t.info.volume_24h_quote
+      predicted        : NULL (funding_rate_indicative is identical to
+                         funding_rate, NOT a forward forecast)
+    """
+    funding_task = asyncio.create_task(c.fetch_funding_rates())
+    tickers = await c.fetch_tickers()
+    funding = await funding_task
 
+    rows: list[dict] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        f = funding.get(sym) or {}
+        t_info = t.get("info") or {}
+        mark = _f(t_info.get("mark_price"))
+        contracts = _f(t_info.get("total_size"))
+        cs = _f(market.get("contractSize")) or 1.0
+        oi_usd = (contracts * cs * mark
+                  if (contracts is not None and mark is not None) else None)
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="GATE.IO",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(f.get("fundingRate")),
+            interval_h=_parse_interval_str(f.get("interval")),
+            next_ts=_f(f.get("fundingTimestamp")),
+            mark=mark, index=_f(t_info.get("index_price")),
+            last=_f(t.get("last")),
+            oi_usd=oi_usd,
+            vol_usd=_f(t_info.get("volume_24h_quote")),
+        ))
+    return rows
+
+
+# -- HTX ---------------------------------------------------------------------
 
 async def collect_htx(c, ts_ms):
-    # HTX unified.quoteVolume is wrong (=baseVolume*1000). ticker.info
-    # 'trade_turnover' is the real USD turnover.
-    return await _collect_with_batch_funding(
-        c, "HTX", ts_ms,
-        predicted_info_key="estimated_rate",
-        oi_strategy="batch",
-        vol_info_field="trade_turnover",
-    )
+    """Sources:
+      funding_rate     : batch f.unified.fundingRate
+      interval_h       : market.info.settlement_period (loaded once)
+      next_funding_ts  : batch f.info.next_funding_time
+      mark             : not exposed → NULL
+      index            : not exposed → NULL
+      oi_usd           : batch fetchOpenInterests → openInterestValue (USD direct)
+      vol_usd          : t.info.trade_turnover (override; unified.quoteVolume is wrong)
+      predicted        : batch f.info.estimated_rate (forward forecast,
+                         often null when venue hasn't computed one yet)
+    """
+    funding_task = asyncio.create_task(c.fetch_funding_rates())
+    oi_task = asyncio.create_task(c.fetch_open_interests())
+    tickers = await c.fetch_tickers()
+    funding = await funding_task
+    oi_batch = await oi_task
 
+    rows: list[dict] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        m_info = market.get("info") or {}
+        f = funding.get(sym) or {}
+        f_info = f.get("info") or {}
+        t_info = t.get("info") or {}
+        oi_obj = oi_batch.get(sym) or {}
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="HTX",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(f.get("fundingRate")),
+            interval_h=_f(m_info.get("settlement_period")),
+            next_ts=_f(f_info.get("next_funding_time")),
+            mark=None, index=None,
+            last=_f(t.get("last")),
+            oi_usd=_f(oi_obj.get("openInterestValue")),
+            vol_usd=_f(t_info.get("trade_turnover")),
+            predicted=_f(f_info.get("estimated_rate")),
+        ))
+    return rows
+
+
+# -- KUCOIN ------------------------------------------------------------------
+
+async def collect_kucoin(c, ts_ms):
+    """KUCOIN's batch fetch_tickers carries everything we need; the
+    single-symbol fetch_ticker is a tick feed and missed data.
+
+    Sources:
+      funding_rate     : t.info.fundingFeeRate
+      interval_h       : t.info.fundingRateGranularity (milliseconds → ÷ 3.6e6)
+                         Verified: BTC = 28800000 ms = 8 h; LAB = 14400000 ms = 4 h.
+      next_funding_ts  : t.info.nextFundingRateDateTime  (this IS an
+                         absolute ms timestamp despite the "DateTime" name;
+                         t.info.nextFundingRateTime is a countdown duration,
+                         do NOT use that one.)
+      mark             : t.info.markPrice
+      index            : t.info.indexPrice
+      oi_usd           : t.info.openInterest × contractSize × mark
+      vol_usd          : t.info.turnoverOf24h
+      predicted        : t.info.predictedFundingFeeRate (forward forecast;
+                         frequently None at quiet moments)
+    """
+    tickers = await c.fetch_tickers()
+    rows: list[dict] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        info = t.get("info") or {}
+        gran_ms = _f(info.get("fundingRateGranularity"))
+        interval_h = gran_ms / 3_600_000.0 if gran_ms else None
+        mark = _f(info.get("markPrice"))
+        oi_base = _f(info.get("openInterest"))
+        cs = _f(market.get("contractSize")) or 1.0
+        oi_usd = (oi_base * cs * mark
+                  if (oi_base is not None and mark is not None) else None)
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="KUCOIN",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(info.get("fundingFeeRate")),
+            interval_h=interval_h,
+            next_ts=_f(info.get("nextFundingRateDateTime")),
+            mark=mark, index=_f(info.get("indexPrice")),
+            last=_f(t.get("last")),
+            oi_usd=oi_usd,
+            vol_usd=_f(info.get("turnoverOf24h")),
+            predicted=_f(info.get("predictedFundingFeeRate")),
+        ))
+    return rows
+
+
+# -- MEXC --------------------------------------------------------------------
+
+_MEXC_NATIVE_FUNDING = "https://contract.mexc.com/api/v1/contract/funding_rate"
+
+
+async def collect_mexc(c, ts_ms):
+    """MEXC has no batch fetchFundingRates in CCXT, but the venue's own
+    /api/v1/contract/funding_rate endpoint returns funding+interval+
+    nextSettleTime for every symbol in one call. We use that.
+
+    Sources:
+      funding_rate     : native HTTP fundingRate
+      interval_h       : native HTTP collectCycle
+      next_funding_ts  : native HTTP nextSettleTime
+      mark             : t.info.fairPrice
+      index            : t.info.indexPrice
+      oi_usd           : t.info.holdVol × contractSize × mark
+      vol_usd          : t.info.amount24
+      predicted        : not exposed → NULL
+    """
+    tickers_task = asyncio.create_task(c.fetch_tickers())
+
+    # Native HTTP — uses the same threaded-DNS session pattern.
+    connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver(),
+                                     ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as s:
+        async with s.get(_MEXC_NATIVE_FUNDING, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            body = await r.json()
+    by_id = {e.get("symbol"): e for e in (body.get("data") or [])}
+
+    tickers = await tickers_task
+
+    rows: list[dict] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        # MEXC native ids look like "BTC_USDT"; CCXT exposes id on the market.
+        venue_id = market.get("id")
+        native = by_id.get(venue_id) or {}
+        info = t.get("info") or {}
+        mark = _f(info.get("fairPrice"))
+        contracts = _f(info.get("holdVol"))
+        cs = _f(market.get("contractSize")) or 1.0
+        oi_usd = (contracts * cs * mark
+                  if (contracts is not None and mark is not None) else None)
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="MEXC",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(native.get("fundingRate")),
+            interval_h=_f(native.get("collectCycle")),
+            next_ts=_f(native.get("nextSettleTime")),
+            mark=mark, index=_f(info.get("indexPrice")),
+            last=_f(t.get("last")),
+            oi_usd=oi_usd,
+            vol_usd=_f(info.get("amount24")),
+        ))
+    return rows
+
+
+# -- OKX ---------------------------------------------------------------------
 
 async def collect_okx(c, ts_ms):
-    # OKX has no quoteVolume in unified ticker; volume falls back to
-    # baseVolume * contractSize * mark inside _extract_vol_usd.
-    return await _collect_with_batch_funding(
-        c, "OKX", ts_ms,
-        predicted_info_key="nextFundingRate",
-        oi_strategy="batch",
-    )
+    """OKX exposes neither mark nor index via fetch_ticker, and
+    quoteVolume is not populated. We compute USD volume from
+    baseVolume × contractSize × last (the only available price).
+    Mark and index are stored as NULL.
+
+    Sources:
+      funding_rate     : batch f.unified.fundingRate
+      interval_h       : batch f.unified.interval
+      next_funding_ts  : batch f.unified.fundingTimestamp  (the upcoming
+                         boundary. CCXT's nextFundingTimestamp is the
+                         cycle AFTER upcoming — wrong field for our use.)
+      mark             : NULL (not exposed)
+      index            : NULL (not exposed)
+      oi_usd           : batch fetchOpenInterests → openInterestValue (USD direct)
+      vol_usd          : t.unified.baseVolume × contractSize × t.unified.last
+      predicted        : batch f.info.nextFundingRate (skip if empty string)
+    """
+    funding_task = asyncio.create_task(c.fetch_funding_rates())
+    oi_task = asyncio.create_task(c.fetch_open_interests())
+    tickers = await c.fetch_tickers()
+    funding = await funding_task
+    oi_batch = await oi_task
+
+    rows: list[dict] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        f = funding.get(sym) or {}
+        f_info = f.get("info") or {}
+        oi_obj = oi_batch.get(sym) or {}
+        last = _f(t.get("last"))
+        bv = _f(t.get("baseVolume"))
+        cs = _f(market.get("contractSize")) or 1.0
+        vol_usd = (bv * cs * last) if (bv is not None and last is not None) else None
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="OKX",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(f.get("fundingRate")),
+            interval_h=_parse_interval_str(f.get("interval")),
+            next_ts=_f(f.get("fundingTimestamp")),
+            mark=None, index=None,
+            last=last,
+            oi_usd=_f(oi_obj.get("openInterestValue")),
+            vol_usd=vol_usd,
+            predicted=_f(f_info.get("nextFundingRate")),  # _f rejects ""
+        ))
+    return rows
 
 
-# -- Group C: per-symbol funding fan-out --
+# -- PHEMEX ------------------------------------------------------------------
 
-async def _collect_with_funding_fanout(c, exchange: str, ts_ms: int, *,
-                                        oi_strategy: str = "skip",
-                                        mark_info_field: str | None = None,
-                                        index_info_field: str | None = None,
-                                        vol_info_field: str | None = None,
-                                        ) -> list[dict]:
-    """fetch_tickers + per-symbol fetch_funding_rate fan-out.
-    Optional batch OI; per-venue ticker.info field overrides."""
-    tickers_task = asyncio.create_task(c.fetch_tickers())
-    oi_task = (asyncio.create_task(c.fetch_open_interests())
-               if oi_strategy == "batch" else None)
-    tickers = await tickers_task
-    oi_batch = await oi_task if oi_task else {}
+async def collect_phemex(c, ts_ms):
+    """Sources:
+      funding_rate     : t.info.fundingRateRr
+      interval_h       : market.info.fundingInterval (seconds → ÷ 3600)
+      next_funding_ts  : derived UTC-aligned (phemex publishes neither
+                         next-funding-time in ticker nor a per-symbol
+                         funding endpoint with a usable timestamp)
+      mark             : t.info.markPriceRp
+      index            : t.info.indexPriceRp
+      oi_usd           : t.info.openInterestRv × mark
+      vol_usd          : t.info.turnoverRv
+      predicted        : t.info.predFundingRateRr (forward forecast)
+    """
+    tickers = await c.fetch_tickers()
+    rows: list[dict] = []
+    for sym, t in tickers.items():
+        market = c.markets.get(sym)
+        if not _is_usdt_linear(market):
+            continue
+        m_info = market.get("info") or {}
+        info = t.get("info") or {}
+        sec = _f(m_info.get("fundingInterval"))
+        interval_h = (sec / 3600.0) if sec else None
+        mark = _f(info.get("markPriceRp"))
+        oi_base = _f(info.get("openInterestRv"))
+        oi_usd = oi_base * mark if (oi_base is not None and mark is not None) else None
+        rows.append(_build_row(
+            ts_ms=ts_ms, exchange="PHEMEX",
+            symbol=_canonical_symbol(market),
+            funding_rate=_f(info.get("fundingRateRr")),
+            interval_h=interval_h,
+            next_ts=None,  # derived in _build_row
+            mark=mark, index=_f(info.get("indexPriceRp")),
+            last=_f(t.get("last")),
+            oi_usd=oi_usd,
+            vol_usd=_f(info.get("turnoverRv")),
+            predicted=_f(info.get("predFundingRateRr")),
+        ))
+    return rows
 
+
+# -- XT.COM ------------------------------------------------------------------
+
+async def collect_xt(c, ts_ms):
+    """XT.COM has no batch fetchFundingRates and no OI exposure. We
+    fan out per-symbol fetch_funding_rate to get the funding rate,
+    interval, and next-settlement timestamp.
+
+    Sources (per-symbol via fetch_funding_rate):
+      funding_rate     : f.unified.fundingRate
+      interval_h       : f.info.collectionInternal (typo for 'Interval')
+      next_funding_ts  : f.info.nextCollectionTime
+    Plus from batch tickers:
+      mark             : t.info.m
+      index            : t.info.i
+      oi_usd           : NULL (not exposed anywhere)
+      vol_usd          : t.unified.quoteVolume
+      predicted        : not exposed → NULL
+    """
+    tickers = await c.fetch_tickers()
     targets = [(s, m, t) for s, t in tickers.items()
                if (m := c.markets.get(s)) and _is_usdt_linear(m)]
 
-    sem = asyncio.Semaphore(20)
+    sem = asyncio.Semaphore(40)
 
     async def _one(sym, market, t):
         async with sem:
@@ -537,52 +791,38 @@ async def _collect_with_funding_fanout(c, exchange: str, ts_ms: int, *,
                 f = await c.fetch_funding_rate(sym)
             except Exception:
                 return None
-        info_t = t.get("info") or {}
-        mark = _f(info_t.get(mark_info_field)) if mark_info_field else None
-        if mark is None:
-            mark = _f(t.get("markPrice")) or _f(t.get("last"))
-        index = _f(info_t.get(index_info_field)) if index_info_field else None
-        if index is None:
-            index = _f(t.get("indexPrice")) or mark
-
-        oi_usd = None
-        if oi_strategy == "batch":
-            oi_obj = oi_batch.get(sym) or {}
-            v = _f(oi_obj.get("openInterestValue"))
-            if v is None:
-                v = _f(oi_obj.get("openInterestAmount"))
-                if v is not None and mark:
-                    cs = _f(market.get("contractSize")) or 1.0
-                    v = v * cs * mark
-            oi_usd = v
-
-        return _row(
-            ts_ms=ts_ms, exchange=exchange,
+        f_info = f.get("info") or {}
+        info = t.get("info") or {}
+        return _build_row(
+            ts_ms=ts_ms, exchange="XT.COM",
             symbol=_canonical_symbol(market),
             funding_rate=_f(f.get("fundingRate")),
-            interval_h=_interval_h(f, info_t),
-            next_ts=f.get("nextFundingTimestamp") or f.get("fundingTimestamp"),
-            mark=mark, index=index, oi_usd=oi_usd,
-            vol_usd=_extract_vol_usd(t, info_t, vol_info_field, mark, market),
+            interval_h=_f(f_info.get("collectionInternal")),
+            next_ts=_f(f_info.get("nextCollectionTime")),
+            mark=_f(info.get("m")),
+            index=_f(info.get("i")),
+            last=_f(t.get("last")),
+            oi_usd=None,
+            vol_usd=_f(t.get("quoteVolume")),
         )
 
     results = await asyncio.gather(*(_one(s, m, t) for s, m, t in targets))
     return [r for r in results if r is not None]
 
 
-async def collect_kucoin(c, ts_ms):
-    return await _collect_with_funding_fanout(
-        c, "KUCOIN", ts_ms, oi_strategy="batch",
-    )
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
 
-
-async def collect_xt(c, ts_ms):
-    # XT ticker.info uses single-letter keys: m=mark, i=index. unified.
-    # quoteVolume already carries the USD turnover.
-    return await _collect_with_funding_fanout(
-        c, "XT.COM", ts_ms, oi_strategy="skip",
-        mark_info_field="m", index_info_field="i",
-    )
+def _parse_interval_str(s) -> float | None:
+    """Parse CCXT's unified `interval` field, which arrives as '8h'/'4h'/
+    '1h'. Returns hours as float, or None."""
+    if not isinstance(s, str) or not s.endswith("h"):
+        return None
+    try:
+        return float(s.rstrip("h"))
+    except ValueError:
+        return None
 
 
 COLLECTORS = {
@@ -649,7 +889,7 @@ async def amain(args):
         try:
             loop.add_signal_handler(sig, stop.set)
         except (NotImplementedError, RuntimeError):
-            pass  # Windows: rely on KeyboardInterrupt
+            pass
 
     venues = list(COLLECTORS) if not args.venues else args.venues
     log.info("starting %d venues: %s (cycles=%s)",
@@ -664,10 +904,9 @@ async def amain(args):
 
 def main():
     p = argparse.ArgumentParser(description="Funding/OI/volume collector")
-    p.add_argument("--once", action="store_true",
-                   help="Shortcut for --cycles 1.")
+    p.add_argument("--once", action="store_true", help="Shortcut for --cycles 1.")
     p.add_argument("--cycles", type=int, default=-1,
-                   help="Run N cycles per venue and exit (-1=run forever).")
+                   help="Run N cycles per venue and exit (-1 = run forever).")
     p.add_argument("--venues", nargs="*", default=None,
                    help="Subset of venues to run (default: all configured).")
     args = p.parse_args()

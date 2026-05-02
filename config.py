@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).parent
 DATA_DIR = PROJECT_ROOT / "data"
 FUNDING_DIR = DATA_DIR / "funding"
 
-POLL_INTERVAL_S = 60
+POLL_INTERVAL_S = 30
 CCXT_TIMEOUT_MS = 30_000  # NordVPN egress adds latency; default 10s is tight.
 
 # Canonical venue slug -> CCXT class id.
