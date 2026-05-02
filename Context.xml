@@ -9,20 +9,26 @@
         </positioning_rationale>
 
         <architectural_primitives>
-            <persistence_substrate>DuckDB embedded over partitioned Parquet files. Zero-daemon, columnar, analytical-SQL native, portable artifacts. Rejects Postgres (ops overhead, weak on window-heavy columnar scans), InfluxDB (schema rigidity during research phase), and SQLite (row-store, poor for analytical scans over millions of rows). Parquet partitioning: year=/month=/day=/, append-only.</persistence_substrate>
+            <persistence_substrate>DuckDB embedded over partitioned Parquet files. Zero-daemon, columnar, analytical-SQL native, portable artifacts. Rejects Postgres (ops overhead, weak on window-heavy columnar scans), InfluxDB (schema rigidity during research phase), and SQLite (row-store, poor for analytical scans over millions of rows). Parquet partitioning: year=/month=/day=/, append-only per-cycle. A daily compaction job (idempotent, atomic per venue) consolidates each prior day's per-cycle files into one file per venue — pure storage optimization, no schema or query-semantic change.</persistence_substrate>
 
             <canonical_schema enforcement="normalized at collector boundary">
                 Every observation conforms to a single locked row shape; exchange-specific idiosyncrasies never leak downstream.
-                Fields: ts_utc (ms), exchange (canonical slug), symbol_canonical (CCXT unified, e.g., BTC/USDT:USDT), funding_rate (raw per-epoch), funding_interval_h (1 | 4 | 8), predicted_rate, next_funding_ts, mark_price, index_price, open_interest_usd, volume_24h_usd, apy_norm ($r \cdot 8760 / T_{epoch}$, computed and stored).
+                Fields: ts_utc (ms), exchange (canonical slug), symbol_canonical (CCXT unified, e.g., BTC/USDT:USDT), funding_rate (raw per-epoch upcoming-boundary rate; refines as TWAP-of-premium-index accumulates), funding_interval_h (positive float, hours; 1 / 4 / 8 most common), predicted_rate (forward forecast for the cycle AFTER the upcoming one — populated only where the venue publishes it), next_funding_ts (UTC-aligned settlement timestamp; mathematically derived from interval when the venue does not publish a per-symbol value), mark_price, index_price, last_price (three price columns of decreasing precision, separate primitives; downstream queries opt into precision tradeoffs explicitly), open_interest_usd, volume_24h_usd, apy_norm ($r \cdot 8760 / T_{epoch}$, computed and stored).
             </canonical_schema>
 
-            <ingestion_topology>Batched REST polling via CCXT fetch_funding_rates() (no-symbol batch call) on a 30–60s cadence per venue. One async task per exchange. WebSockets explicitly rejected: the scanner's physics is wide-and-shallow across hundreds of symbols, inverse of the engine's deep-and-narrow single-pair streams. Aggregate request budget remains trivially under every venue's rate limit.</ingestion_topology>
+            <integrity_invariant>
+                Every schema field has exactly one authoritative per-venue source. If the source is missing for a row, the field is NULL. No cascading fallbacks (e.g., last-trade-price substituted for mark_price, default 8h for an unknown interval) — those silently corrupt the longitudinal dataset, which is the project's compounding asset. The collector enforces the invariant at the boundary; new venues require probe-driven verification of every per-field source before integration.
+            </integrity_invariant>
+
+            <ingestion_topology>REST polling at 30s cadence, one async task per venue. Per-venue strategy is bespoke — batch funding endpoints where preserved, ticker.info paths where the data is piggybacked there, per-symbol fan-out or native HTTP where neither works. WebSockets explicitly rejected for this layer: the scanner's physics is wide-and-shallow across hundreds of symbols, inverse of the engine's deep-and-narrow single-pair streams. Aggregate request budget remains comfortably under each venue's public rate limit even with concurrency-bumped fan-outs.</ingestion_topology>
 
             <process_boundary>Scanner and engine run as fully separate OS processes with independent lifecycles and failure domains. No shared runtime state. Any engine-side read of scanner data occurs strictly via DuckDB query against Parquet files or a read-only HTTP endpoint—never via in-memory coupling. Guarantees that scanner analytics pressure can never stall the engine's event loop.</process_boundary>
         </architectural_primitives>
 
         <components>
-            <collectors type="Async REST Pollers">One task per exchange. Pulls batch funding snapshots, applies canonical normalization (symbol unification, interval detection, USD conversion, $APY_{norm}$ computation), appends to the active Parquet partition. Failure of any single venue is isolated and logged; other collectors continue uninterrupted.</collectors>
+            <collectors type="Async REST Pollers">One task per exchange. Pulls the per-venue authoritative source for each schema field (documented in FIELD_NOTES.md), applies USD conversion where required, computes $APY_{norm}$, appends to the active Parquet partition. Failure of any single venue is isolated and logged; sibling collectors continue uninterrupted.</collectors>
+
+            <verification_harness role="Per-venue source audit">audit.py: re-probes every authoritative source per (venue, schema field) on demand against live CCXT. Run when CCXT is upgraded, when a venue's API rotates fields, or when adding a new venue. The output is the single source of truth for per-venue extraction; FIELD_NOTES.md mirrors it.</verification_harness>
 
             <analytics_layer form="Parameterized SQL views over DuckDB">
                 <anomaly_candidates>Symbols where $|APY_{norm}| \geq \theta$ AND $volume_{24h} \geq V_{min}$ AND the anomaly has persisted across $\geq N$ consecutive observations. Persistence filter rejects single-tick spikes (data errors or already-decayed transients).</anomaly_candidates>
@@ -32,7 +38,7 @@
 
             <dashboard stack="Streamlit + Plotly" role="Live Radar/Scanner">Single-operator, localhost-bound. Surfaces the three analytics views as sortable tables plus per-symbol historical funding charts with cross-exchange overlay. Graduation rule: patterns earn a place on the dashboard only after proving themselves in the research layer.</dashboard>
 
-            <alerts transport="Pushover">Threshold-breach hook reusing the engine's existing Pushover credentials. Mobile surface is Pushover only; no native mobile app.</alerts>
+            <alerts transport="Pushover">Two surfaces: anomaly threshold-breach notifications driven by the analytics layer, plus a data-flow liveness watch that pings if no Parquet write is observed in a 5-minute window (cooldown to prevent spam during extended outages). Reuses the engine's Pushover credentials. Mobile surface is Pushover only; no native mobile app.</alerts>
 
             <research_layer tooling="Jupyter/Marimo notebooks">Exploratory lab bench over the same DuckDB substrate. Hosts the proprietary pattern studies: anomaly half-life distributions, cross-exchange funding lead-lag, basis behavior during anomalies, post-payout mean-reversion. Free use of sklearn/statsmodels/scipy at this layer; nothing ships to the live radar without being expressible as clear SQL logic.</research_layer>
             <diagram_of_proposed_architecture>
@@ -70,6 +76,6 @@
             <no_charting_platform_drift>The scanner is not a charting app, not a data platform, not a second product. Any feature pulling it in those directions is rejected.</no_charting_platform_drift>
         </scope_guardrails>
 
-        <deployment_posture>Runs on the same Singapore VPS as the engine, as an independent systemd-managed process. Shares the VPS's geographic latency barycenter across the 13 target venues, though latency is not a first-order concern for the scanner's polling cadence.</deployment_posture>
+        <deployment_posture>Singapore VPS, co-located with the engine but with fully independent lifecycle. Two systemd services — arb-collector (ingestion) and arb-dashboard (Streamlit radar) — plus two cron jobs (daily Parquet compaction, 5-minute liveness watch). The engine never shares runtime state with any of them; engine-side reads of scanner data go strictly through the Parquet substrate. Shares the VPS's geographic latency barycenter across the 13 target venues, though latency is not a first-order concern for the scanner's polling cadence.</deployment_posture>
     </project>
 </context>
