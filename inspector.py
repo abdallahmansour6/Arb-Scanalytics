@@ -64,11 +64,13 @@ def overview():
 def btc():
     db = _open()
     print("\n=== BTC/USDT:USDT across venues (latest per venue) ===")
+    # No coalesce on predicted_rate — null distinguishes venues that don't
+    # expose a forward forecast (most of them) from those that do.
     _print_df(db.sql("""
         select exchange,
                round(funding_rate, 6) as rate,
                funding_interval_h as h,
-               round(coalesce(predicted_rate, funding_rate), 6) as predicted,
+               round(predicted_rate, 6) as predicted,
                round(apy_norm * 100, 2) as apy_pct,
                round(mark_price, 2) as mark,
                round(open_interest_usd / 1e6, 1) as oi_musd,
@@ -83,23 +85,49 @@ def btc():
 def spreads(limit: int = 20):
     db = _open()
     print(f"\n=== top {limit} cross-venue funding spreads (latest, both legs >= $1M vol) ===")
+    # Per-leg refactor: short_* and long_* values come from the exact two
+    # venues with the highest / lowest APY for each symbol — NOT from
+    # min/max aggregations across the symbol's other venues.
     _print_df(db.sql(f"""
         with latest as (
             select * from f
             qualify row_number() over (partition by exchange, symbol_canonical
                                        order by ts_utc desc) = 1
+        ),
+        ranked as (
+            select *,
+                   row_number() over (partition by symbol_canonical
+                                      order by apy_norm desc, exchange) as rk_high,
+                   row_number() over (partition by symbol_canonical
+                                      order by apy_norm asc,  exchange) as rk_low,
+                   count(*)     over (partition by symbol_canonical) as listings
+            from latest
+        ),
+        shorts as (
+            select symbol_canonical, listings,
+                   exchange       as venue_short,
+                   apy_norm       as short_apy,
+                   volume_24h_usd as short_vol_usd
+            from ranked where rk_high = 1
+        ),
+        longs as (
+            select symbol_canonical,
+                   exchange       as venue_long,
+                   apy_norm       as long_apy,
+                   volume_24h_usd as long_vol_usd
+            from ranked where rk_low = 1
         )
-        select symbol_canonical,
-               count(*) as n_venues,
-               arg_max(exchange, apy_norm)  as venue_high,
-               arg_min(exchange, apy_norm)  as venue_low,
-               round(max(apy_norm)*100, 1)  as apy_high_pct,
-               round(min(apy_norm)*100, 1)  as apy_low_pct,
-               round((max(apy_norm) - min(apy_norm)) * 100, 1) as delta_apy_pct,
-               round(min(volume_24h_usd)/1e6, 1) as min_vol_musd
-        from latest
-        group by 1
-        having count(*) >= 2 and min(volume_24h_usd) >= 1e6
+        select s.symbol_canonical,
+               s.listings,
+               s.venue_short, l.venue_long,
+               round(s.short_apy * 100, 1)                  as short_apy_pct,
+               round(l.long_apy  * 100, 1)                  as long_apy_pct,
+               round((s.short_apy - l.long_apy) * 100, 1)   as delta_apy_pct,
+               round(s.short_vol_usd / 1e6, 1)              as short_vol_musd,
+               round(l.long_vol_usd  / 1e6, 1)              as long_vol_musd
+        from shorts s join longs l using (symbol_canonical)
+        where s.listings >= 2
+          and s.short_vol_usd >= 1e6 and l.long_vol_usd >= 1e6
         order by delta_apy_pct desc
         limit {limit}
     """).df())

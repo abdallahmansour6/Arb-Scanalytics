@@ -300,6 +300,13 @@ expensive part).
 - DuckDB does not have an `epoch_ms(timestamp)` function in 4.5.x; use
   `(epoch(now()) * 1000)::BIGINT` to get current ms-since-epoch in SQL,
   or compute it in Python.
+- **DuckDB infers INT32 from bound int parameters by default.**
+  Multiplications inside SQL (`? * 3600 * 1000`) overflow at hours ≥ ~596.
+  Symptom in our pipe: `OutOfRangeException: Overflow in multiplication
+  of INT32 (2592000 * 1000)` for hours=720. Fix: compute the offset in
+  Python (`offset_ms = hours * 3600 * 1000`) and pass the already-large
+  result as a single bound parameter — DuckDB infers INT64 for values
+  beyond the INT32 range.
 - `read_parquet('path/**/*.parquet', hive_partitioning=true,
   union_by_name=true)` works cross-platform if forward slashes are used
   in the glob — even on Windows with backslashed paths, just `.replace("\\", "/")`.
