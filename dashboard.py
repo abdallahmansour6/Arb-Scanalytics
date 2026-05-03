@@ -9,13 +9,23 @@ VS Code Remote-SSH auto-detects the listening port (default 8501) and
 surfaces a 'Open in browser' toast that opens it through the SSH tunnel.
 
 Refresh mechanics:
-  - Header (top metrics + freshness dot) auto-reruns every 10 s.
-  - Each tab's data tables auto-rerun every 10 s via st.fragment.
+  - Header (top metrics + freshness dot) auto-reruns every 10 s — small,
+    cheap visual update so the freshness indicator feels alive.
+  - Tables (anomalies, spreads) auto-rerun every 30 s via st.fragment,
+    aligned with the collector's 30 s polling cadence — refreshing
+    faster just re-renders the same data and dims the table for
+    nothing.
   - Filter widgets are OUTSIDE the fragments — typing in a number_input
     doesn't get clobbered by an auto-rerun.
-  - Underlying queries are @st.cache_data(ttl=10); the fragment rerun
-    races the cache TTL so a fresh query happens roughly every 10 s.
-  - End-to-end disk-write → display latency: ~10 s typical.
+  - `_latest_snapshot()` is @st.cache_data(ttl=30) — matches the table
+    refresh, so each fragment run does at most one parquet read.
+  - History tab is gated behind an explicit click (see render_history).
+    Two reasons: (1) Streamlit evaluates every tab body on every full
+    rerun even when hidden, so the chart-build cost would otherwise
+    pile onto unrelated reruns (filter changes on other tabs);
+    (2) it matches the section's documented intent — user-driven, not
+    auto-refreshing.
+  - End-to-end disk-write → display latency: ~30 s typical.
 
 Rate semantics (display labels mirror SCHEMA in collector.py):
   - "Rate (next epoch)"      = upcoming-boundary rate (B), what trades
@@ -201,7 +211,7 @@ def _history_files(hours: int) -> list[str]:
     return selected
 
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=30)
 def _latest_snapshot() -> pd.DataFrame:
     """One row per (exchange, symbol_canonical) — most recent observation,
     with global oi_rank descending by open_interest_usd. Null OI sorts to
@@ -237,9 +247,14 @@ def _latest_snapshot() -> pd.DataFrame:
     return pd.DataFrame()  # unreachable; keeps type-checker happy
 
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=60)
 def _history(symbol: str, hours: int) -> pd.DataFrame:
-    """Time-windowed history for a single symbol across all venues."""
+    """Time-windowed history for a single symbol across all venues.
+
+    Longer ttl than the snapshot cache: history is user-driven, so we'd
+    rather absorb a few unrelated reruns (filter changes on other tabs
+    that re-evaluate the History tab body) into one cache-hit re-render
+    than re-fetch on each."""
     # Compute the offset in Python: hours * 3600 * 1000 overflows DuckDB's
     # INT32 inference at hours >= ~596 (720 was the trigger seen in the
     # wild). Python ints are arbitrary precision, and passing the result
@@ -539,7 +554,7 @@ def render_header():
         st.rerun()
 
 
-@st.fragment(run_every=10)
+@st.fragment(run_every=30)
 def render_anomalies():
     snapshot = _latest_snapshot()
     if snapshot.empty:
@@ -589,7 +604,7 @@ def render_anomalies():
     )
 
 
-@st.fragment(run_every=10)
+@st.fragment(run_every=30)
 def render_spreads():
     snapshot = _latest_snapshot()
     if snapshot.empty:
@@ -953,6 +968,24 @@ def render_history(snapshot: pd.DataFrame):
     sym = st.selectbox(
         "Symbol", symbols, index=symbols.index(default_sym), key="hist_symbol"
     )
+
+    # Lazy gate. Streamlit evaluates every tab body on every full-page rerun,
+    # even when the tab isn't visible — so unconditionally rendering the two
+    # charts here would put the parquet read + figure build + browser repaint
+    # in the critical path of unrelated reruns (e.g., touching a filter on
+    # the Anomalies tab). The flag is per-session and persists until a
+    # browser refresh; once set, subsequent symbol/window changes re-fetch
+    # and re-render in place.
+    if not st.session_state.get("hist_loaded"):
+        st.caption(
+            "History charts are loaded on demand to keep the live radar "
+            "tabs snappy across unrelated interactions. Click to load."
+        )
+        if st.button("Load history charts", type="primary"):
+            st.session_state.hist_loaded = True
+            st.rerun()
+        return
+
     venues_avail = sorted(
         snapshot.loc[snapshot["symbol_canonical"] == sym, "exchange"].unique()
     )
