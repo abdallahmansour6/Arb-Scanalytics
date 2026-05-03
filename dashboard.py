@@ -858,6 +858,28 @@ def render_history(snapshot: pd.DataFrame):
     sym = st.selectbox(
         "Symbol", symbols, index=symbols.index(default_sym), key="hist_symbol"
     )
+
+    # Lazy gate. Streamlit evaluates every tab body on every main() rerun
+    # regardless of which tab is active, so rendering charts here would
+    # block the dashboard's initial render on the slow `_history` read
+    # (tens of seconds for 24 h+ windows on an un-compacted day, where
+    # the per-venue file pruning can't shrink the file set below
+    # "all of today"). Match the section's documented intent
+    # ('user-driven, no auto-refresh') by gating chart rendering on an
+    # explicit click. The flag is per-session and persists until a
+    # browser refresh; subsequent symbol/window changes just re-fetch
+    # and re-render in place.
+    if not st.session_state.get("hist_loaded"):
+        st.caption(
+            "History reads scan parquet partitions on disk; long windows "
+            "over an un-compacted day can take tens of seconds. "
+            "Click to load."
+        )
+        if st.button("Load history charts", type="primary"):
+            st.session_state.hist_loaded = True
+            st.rerun()
+        return
+
     venues_avail = sorted(
         snapshot.loc[snapshot["symbol_canonical"] == sym, "exchange"].unique()
     )
