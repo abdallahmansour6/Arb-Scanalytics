@@ -1021,7 +1021,11 @@ def render_history(snapshot: pd.DataFrame):
     chosen2, hours2 = _venue_timeframe_row(
         "chart_raw",
         venues_avail,
-        default_venues=venues_avail[:4] if len(venues_avail) > 4 else venues_avail,
+        # Default to 2 venues: chart-2 build cost (subplots + vlines +
+        # annotations per panel) scales with panel count, and 2 panels
+        # is enough for the typical "compare these two specifically"
+        # check. Add more via the multiselect when needed.
+        default_venues=venues_avail[:2] if len(venues_avail) > 2 else venues_avail,
     )
     _render_chart_per_venue(sym, chosen2, hours2, venues_avail)
 
