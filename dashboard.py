@@ -70,8 +70,14 @@ log = logging.getLogger("dashboard")
 @st.cache_data(ttl=30)
 def _latest_snapshot() -> pd.DataFrame:
     """One row per (exchange, symbol_canonical) — most recent observation,
-    with global oi_rank descending by open_interest_usd. Null OI sorts to
-    the bottom of the rank order."""
+    with oi_rank descending by open_interest_usd.
+
+    Rows whose venue does not publish OI (notably all of XT.COM, plus
+    per-cycle fan-out failures on BINANCE/BINGX) get oi_rank = NULL —
+    they're unranked, not artificially low-ranked. Coalescing NULL → 0
+    would silently bury them at the rank tail and let any narrow OI band
+    in the dashboard mute them entirely; with NULL they fall through the
+    rank filter and get judged on volume / APY instead."""
     # repr() on a list[str] yields a SQL list literal — file paths come
     # from FUNDING_DIR.glob (filesystem-controlled, never user input), so
     # direct embedding is safe.
@@ -83,9 +89,11 @@ def _latest_snapshot() -> pd.DataFrame:
                                            order by ts_utc desc) = 1
             )
             select *,
-                   row_number() over (
-                       order by coalesce(open_interest_usd, 0) desc, exchange
-                   ) as oi_rank
+                   case when open_interest_usd is null then null
+                        else row_number() over (
+                            order by open_interest_usd desc nulls last, exchange
+                        )
+                   end as oi_rank
             from latest
         """).df()
 
@@ -201,7 +209,10 @@ def _column_config(extra: dict | None = None) -> dict:
         "vol_musd": st.column_config.NumberColumn("Vol $M", format="%.1f"),
         "oi_musd": st.column_config.NumberColumn("OI $M", format="%.1f"),
         "oi_rank": st.column_config.NumberColumn(
-            "OI rank", format="%d", help="1 = highest OI globally"
+            "OI rank",
+            format="%d",
+            help="1 = highest OI globally. Empty = venue does not "
+            "publish OI for this pair (unranked).",
         ),
         "listings": st.column_config.NumberColumn(
             "Listings",
@@ -267,9 +278,11 @@ def _filter_inputs(
     larger-magnitude inputs (volume in $M, decimals) get more pixels than
     smaller ones (min-venues, 2-digit). Each group is wrapped in a bordered
     container so the eye groups related controls visually."""
-    total = len(snapshot)
+    # max() guard for the degenerate case where every row is NULL-OI; the
+    # number_input bounds would otherwise be invalid (max < min).
+    ranked_total = max(1, int(snapshot["oi_rank"].notna().sum()))
     max_vol_musd = float(snapshot["volume_24h_usd"].max() or 0) / 1e6
-    default_oi_max = min(500, total)
+    default_oi_max = min(500, ranked_total)
     default_vol_max = float(round(max_vol_musd + 1, 0))
 
     # Outer weights ≈ relative content widths.
@@ -287,7 +300,7 @@ def _filter_inputs(
                 st.number_input(
                     "From",
                     min_value=1,
-                    max_value=total,
+                    max_value=ranked_total,
                     value=1,
                     step=10,
                     key=f"{prefix}_oi_min",
@@ -296,14 +309,16 @@ def _filter_inputs(
                 st.number_input(
                     "To",
                     min_value=1,
-                    max_value=total,
+                    max_value=ranked_total,
                     value=default_oi_max,
                     step=10,
                     key=f"{prefix}_oi_max",
                 )
             st.caption(
-                f"Rank 1 = highest OI · rank {total:,} = lowest. "
-                "Pairs with no OI data are ranked at the bottom."
+                f"Rank 1 = highest OI · rank {ranked_total:,} = lowest. "
+                "Pairs without OI data (XT.COM, plus per-cycle misses) are "
+                "unranked and pass this filter regardless of the band — they "
+                "get judged by the volume / settlement filters instead."
             )
 
     with groups[1]:
@@ -356,8 +371,12 @@ def _filter_inputs(
 
 
 def _apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
+    # NULL-OI rows are unranked (see _latest_snapshot); they pass the rank
+    # filter unconditionally so a narrow band can't silently mute venues
+    # that don't expose OI. The volume filter still gets its say — that's
+    # the safety net for the candidate's actual tradeability.
     out = df[
-        df["oi_rank"].between(f["oi_min"], f["oi_max"])
+        (df["oi_rank"].isna() | df["oi_rank"].between(f["oi_min"], f["oi_max"]))
         & df["volume_24h_usd"].fillna(0).between(f["vol_min_usd"], f["vol_max_usd"])
     ]
     if f["settles_max"] > 0:
