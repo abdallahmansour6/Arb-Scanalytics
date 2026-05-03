@@ -723,6 +723,23 @@ def _color_for(venue: str, all_venues: list[str]) -> str:
     return _PALETTE[sorted(all_venues).index(venue) % len(_PALETTE)]
 
 
+def _downsample_for_chart(df: pd.DataFrame, max_points: int = 1000) -> pd.DataFrame:
+    """Stride-downsample a sorted-by-time DataFrame to at most ~max_points
+    rows. Plotly chokes on multi-thousand-point traces (heavy JSON, slow
+    paint, laggy hover/scroll); ~1 point per horizontal pixel is the
+    natural ceiling for what the user can perceive anyway. Stride sampling
+    preserves cycle-boundary step shapes well enough for the chart-level
+    view — the research notebooks read raw cycle data when fidelity matters.
+
+    Boundary vlines and per-panel σ/range annotations are derived from the
+    *full* DataFrame upstream of this call so they stay accurate.
+    """
+    if len(df) <= max_points:
+        return df
+    stride = (len(df) + max_points - 1) // max_points
+    return df.iloc[::stride]
+
+
 _RANGE_BUTTONS = dict(
     buttons=[
         dict(count=1, label="1h", step="hour", stepmode="backward"),
@@ -757,12 +774,12 @@ def _venue_timeframe_row(
         key=f"{prefix}_hours",
         help=(
             "Number of hours of history to pull from disk. Bounded only by "
-            "how long the collector has been running. Larger windows mean "
-            "more points for Plotly to render — interaction stays smooth "
-            "up to ~100k total points (≈ 720h on the all-venue chart, more "
-            "headroom on the per-venue chart since each panel sees fewer "
-            "points). Once fetched, use the chart's range buttons "
-            "(1h/6h/1d/3d/1w/All) or drag-zoom to focus."
+            "how long the collector has been running. Each trace is "
+            "stride-downsampled to ~1000 points before rendering, and "
+            "drawn via WebGL (Scattergl), so chart interaction stays "
+            "smooth at any window size — fetch time scales with the "
+            "underlying parquet read. Once fetched, use the chart's range "
+            "buttons (1h/6h/1d/3d/1w/All) or drag-zoom to focus."
         ),
     )
     return chosen, hours
@@ -784,15 +801,22 @@ def _render_chart_apy(sym: str, chosen: list[str], hours: int, all_venues: list[
     hist["ts_utc"] = pd.to_datetime(hist["ts_utc"], unit="ms", utc=True)
 
     fig = go.Figure()
+    rendered = 0
     for venue in chosen:
-        d = hist[hist["exchange"] == venue].sort_values("ts_utc")
-        if d.empty:
+        d_full = hist[hist["exchange"] == venue].sort_values("ts_utc")
+        if d_full.empty:
             continue
+        d = _downsample_for_chart(d_full)
+        rendered += len(d)
         fig.add_trace(
-            go.Scatter(
+            # Scattergl renders to a WebGL canvas instead of SVG — same
+            # API, dramatically faster for >1 k points (initial paint,
+            # hover, scroll). Markers drop out for dense traces since
+            # they're indistinguishable when overlapping pixel-by-pixel.
+            go.Scattergl(
                 x=d["ts_utc"],
                 y=d["apy_pct"],
-                mode="lines+markers",
+                mode="lines+markers" if len(d) <= 200 else "lines",
                 name=venue,
                 line=dict(color=_color_for(venue, all_venues), width=1.5),
                 marker=dict(size=4),
@@ -810,7 +834,10 @@ def _render_chart_apy(sym: str, chosen: list[str], hours: int, all_venues: list[
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig, width="stretch")
-    st.caption(f"{len(hist):,} observations across {hist['exchange'].nunique()} venues")
+    st.caption(
+        f"{len(hist):,} observations across {hist['exchange'].nunique()} venues "
+        f"· rendered {rendered:,} points after downsampling"
+    )
 
 
 def _render_chart_per_venue(
@@ -850,17 +877,20 @@ def _render_chart_per_venue(
     )
 
     for i, venue in enumerate(visible, start=1):
-        d = hist[hist["exchange"] == venue].sort_values("ts_utc")
-        if d.empty:
+        d_full = hist[hist["exchange"] == venue].sort_values("ts_utc")
+        if d_full.empty:
             continue
         color = _color_for(venue, all_venues)
-        cycle_h = int(d["funding_interval_h"].iloc[-1] or 0)
+        cycle_h = int(d_full["funding_interval_h"].iloc[-1] or 0)
 
+        # Trace from downsampled data; metadata (boundaries, σ, range) is
+        # computed from the FULL DataFrame below so accuracy isn't affected.
+        d = _downsample_for_chart(d_full)
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=d["ts_utc"],
                 y=d["funding_rate"],
-                mode="lines+markers",
+                mode="lines+markers" if len(d) <= 200 else "lines",
                 name=venue,
                 showlegend=False,
                 line=dict(color=color, width=1.5),
@@ -875,8 +905,10 @@ def _render_chart_per_venue(
         )
 
         # Boundary vlines — one per unique next_funding_ts in the window.
+        # Computed from full data so we don't accidentally skip a boundary
+        # whose rows happened to fall outside the downsampling stride.
         boundaries = (
-            pd.to_datetime(d["next_funding_ts"], unit="ms", utc=True)
+            pd.to_datetime(d_full["next_funding_ts"], unit="ms", utc=True)
             .dropna()
             .drop_duplicates()
             .sort_values()
@@ -886,9 +918,9 @@ def _render_chart_per_venue(
                 x=b, line_dash="dot", line_color="gray", opacity=0.45, row=i, col=1
             )
 
-        # Per-panel volatility annotation (top-right of each panel)
-        stdev = float(d["funding_rate"].std() or 0.0)
-        rng = float(d["funding_rate"].max() - d["funding_rate"].min())
+        # Per-panel volatility annotation — full-data stats, not downsampled.
+        stdev = float(d_full["funding_rate"].std() or 0.0)
+        rng = float(d_full["funding_rate"].max() - d_full["funding_rate"].min())
         fig.add_annotation(
             text=f"cycle: {cycle_h}h  ·  σ = {stdev:.2e}  ·  range = {rng:.2e}",
             xref=f"x{i if i > 1 else ''} domain",
