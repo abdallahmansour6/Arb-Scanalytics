@@ -70,7 +70,6 @@ Usage
 
 import argparse
 import logging
-import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -79,28 +78,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from config import FUNDING_DIR
+from store import CYCLE_RE, venue_of_source
 
 log = logging.getLogger("compact")
 
 
-# Filename conventions for the lifecycle's three states. Must stay in
-# sync with the matching regexes in dashboard.py — both modules need to
-# distinguish per-cycle (sortable by ms timestamp) from already-compacted
-# (always included as deeper fallback).
-_CYCLE_RE = re.compile(r"^([A-Z\.]+)_(\d{13})\.parquet$")
-_HOURLY_RE = re.compile(r"^([A-Z\.]+)_hourly_(\d{10})\.parquet$")
-_DAILY_RE = re.compile(r"^([A-Z\.]+)_daily\.parquet$")
-
-
-def _venue_of_source(name: str) -> str | None:
-    """Return the venue for a *source* file (per-cycle or hourly).
-    None for already-compacted daily files or unrecognized names — those
-    are skipped by callers."""
-    for pat in (_CYCLE_RE, _HOURLY_RE):
-        m = pat.match(name)
-        if m:
-            return m.group(1)
-    return None
+# Filename conventions live in `store.py` so dashboard.py and any future
+# parquet consumer share the same shapes. We import the per-cycle regex
+# directly (used by hourly bucket-membership checks) and the
+# `venue_of_source` helper (used by daily compaction to identify per-cycle
+# + hourly source files vs already-rolled-up daily targets).
 
 
 def _partition_path(d: date) -> Path:
@@ -190,7 +177,7 @@ def compact_hour(
 
     by_venue: dict[str, list[Path]] = {}
     for f in sorted(partition.glob("*.parquet")):
-        m = _CYCLE_RE.match(f.name)
+        m = CYCLE_RE.match(f.name)
         if not m:
             continue  # already-compacted hourly/daily files are skipped
         ts_ms = int(m.group(2))
@@ -237,7 +224,7 @@ def compact_pending_hours(
         if not partition.exists():
             continue
         for f in partition.glob("*.parquet"):
-            m = _CYCLE_RE.match(f.name)
+            m = CYCLE_RE.match(f.name)
             if not m:
                 continue
             ts_ms = int(m.group(2))
@@ -274,7 +261,7 @@ def compact_day(
 
     by_venue: dict[str, list[Path]] = {}
     for f in sorted(partition.glob("*.parquet")):
-        venue = _venue_of_source(f.name)
+        venue = venue_of_source(f.name)
         if venue is None:
             continue  # already-compacted daily file or unrecognized
         by_venue.setdefault(venue, []).append(f)

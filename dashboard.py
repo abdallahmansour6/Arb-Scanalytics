@@ -39,18 +39,15 @@ Funding-arb directionality:
 """
 
 import logging
-import re
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
 
-import duckdb
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from config import FUNDING_DIR
+import store
 
 # Field-notes: VS Code Remote-SSH port-forward probes generate
 # 'Invalid HTTP request received' warnings from tornado. Silence; benign.
@@ -59,156 +56,15 @@ logging.getLogger("tornado.general").setLevel(logging.ERROR)
 log = logging.getLogger("dashboard")
 
 
-# Filename conventions for the parquet store's three lifecycle states
-# (must stay in sync with compact.py — both modules agree on the shape):
-#
-#   per-cycle:  <VENUE>_<ms_ts>.parquet            (collector, 30 s cadence)
-#   hourly:     <VENUE>_hourly_<YYYYMMDDHH>.parquet (compact.py --mode hourly)
-#   daily:      <VENUE>_daily.parquet              (compact.py --mode daily)
-#
-# Per-cycle is sortable-by-ms (last digit-group is the cycle's ms timestamp).
-# Hourly is sortable-by-bucket (last digit-group is YYYYMMDDHH and orders
-# correctly as a string or as int). Daily is per-venue, no temporal sort
-# needed — it's the deepest fallback.
-_CYCLE_FILE_RE = re.compile(r"([A-Z\.]+)_(\d{13})\.parquet$")
-_HOURLY_FILE_RE = re.compile(r"([A-Z\.]+)_hourly_(\d{10})\.parquet$")
-
-
 # --------------------------------------------------------------------------
-# data access
+# data access — Streamlit-cached wrappers around store.py primitives
 # --------------------------------------------------------------------------
 #
-# Both queries (`_latest_snapshot()` and `_history()`) follow the same
-# pattern: enumerate exactly the parquet files needed in Python (~150 ms
-# for a 26 k-file directory walk), then read them on a *fresh* DuckDB
-# connection that lives only for the duration of the query. We avoid the
-# wide-glob `read_parquet('**/*.parquet')` view because:
-#
-#   * DuckDB walks every parquet footer to register the view, which alone
-#     takes ~22 s on today's un-compacted partition and can exhaust the
-#     default 1024 FD limit on full-fan-out aggregates.
-#   * A `@st.cache_resource` connection can be left in a bad state if a
-#     Streamlit rerun interrupts a query mid-flight, poisoning callers.
-#
-# `_latest_files()` keeps the K most recent per-cycle files per venue;
-# `_history_files()` keeps per-cycle files within the time window. Both
-# always include all hourly + daily compacted files as the deeper
-# fallback for older history.
-#
-# Compaction race
-# ---------------
-# The hourly compactor (compact.py) runs on today's partition while the
-# dashboard is reading it. Its atomic `rename + delete sources` pattern
-# means a per-cycle file can vanish in the millisecond gap between our
-# Python file-list enumeration and DuckDB's open. We catch DuckDB's
-# `Cannot open file` IOException and retry once with a fresh enumeration
-# — the second attempt sees the post-compaction file set.
-
-
-def _classify_files() -> tuple[
-    dict[str, list[tuple[int, str]]],
-    dict[str, list[tuple[int, str]]],
-    list[str],
-]:
-    """Walk FUNDING_DIR once and bucket every `*.parquet` by lifecycle.
-    Returns (per_venue_cycle, per_venue_hourly, daily_or_unknown), where
-    each per-venue list is `[(ms_anchor, path), ...]`:
-      * cycle: ms_anchor is the cycle's filename ms timestamp.
-      * hourly: ms_anchor is the bucket's start-of-hour ms (parsed from
-        the YYYYMMDDHH suffix), so consumers can compare it to a window
-        cutoff in the same units as cycle.
-
-    The Python-side enumeration is the only directory walk in the
-    dashboard's hot path (~150 ms for ~10 k files); both `_latest_files()`
-    and `_history_files()` consume this single classification."""
-    cycle: dict[str, list[tuple[int, str]]] = defaultdict(list)
-    hourly: dict[str, list[tuple[int, str]]] = defaultdict(list)
-    daily: list[str] = []
-    for path in FUNDING_DIR.glob("**/*.parquet"):
-        # Forward slashes for cross-platform DuckDB compatibility — Path
-        # stringifies with backslashes on Windows, which we don't want
-        # leaking into a SQL string literal.
-        spath = str(path).replace("\\", "/")
-        m = _CYCLE_FILE_RE.search(path.name)
-        if m:
-            cycle[m.group(1)].append((int(m.group(2)), spath))
-            continue
-        m = _HOURLY_FILE_RE.search(path.name)
-        if m:
-            s = m.group(2)  # "YYYYMMDDHH"
-            bucket_ms = int(datetime(
-                int(s[:4]), int(s[4:6]), int(s[6:8]), int(s[8:10]),
-                tzinfo=timezone.utc,
-            ).timestamp() * 1000)
-            hourly[m.group(1)].append((bucket_ms, spath))
-            continue
-        daily.append(spath)
-    return cycle, hourly, daily
-
-
-def _latest_files(k_cycle: int = 20, k_hourly: int = 3) -> list[str]:
-    """Files needed to build a 'latest snapshot per (exchange, symbol)' view.
-
-    For each venue: the `k_cycle` most recent per-cycle files (covers the
-    last ~10 min at K=20, 30 s cadence) plus the `k_hourly` most recent
-    hourly compacted files (a few hours of fallback) plus all daily files.
-    A pair that's been intermittently dropped from a venue's batch
-    responses for up to a few hours still surfaces in the snapshot via
-    `qualify rn=1`'s pick of the most recent row across these files.
-
-    Bounded file count: 13 venues × (k_cycle + k_hourly) + ~13 daily ≈
-    a few hundred paths at most. Reading all 24 of today's hourly files
-    would inflate that by 312 with no benefit for snapshot semantics —
-    the 'fallback for an intermittently-dropped pair' use-case only
-    needs *recent* hourly buckets."""
-    cycle, hourly, daily = _classify_files()
-    selected = list(daily)
-    for items in hourly.values():
-        items.sort(reverse=True)
-        selected.extend(p for _, p in items[:k_hourly])
-    for items in cycle.values():
-        items.sort(reverse=True)
-        selected.extend(p for _, p in items[:k_cycle])
-    return selected
-
-
-def _history_files(hours: int) -> list[str]:
-    """Files needed to cover the last `hours` of history for any symbol.
-
-    Per-cycle files within the window (cutoff = max-filename-ms − hours_ms)
-    plus hourly compacted buckets that *intersect* the window plus all
-    daily files. Hourly files are typed as `bucket-start ms` so a bucket
-    intersects the window iff `bucket_start + 3600_000 > cutoff`. The SQL
-    still applies the exact ts_utc filter on top, so any imprecision in
-    the file-set bounds only changes which files we read, not the result.
-
-    With hourly compaction running, today's partition holds at most ~1 h
-    of un-compacted per-cycle files plus the bucket files for completed
-    hours; for a 24 h window we read ~1 h of cycles + 24 hourly + ~13
-    daily ≈ a few hundred files. Without compaction we'd be scanning
-    all of today's per-cycle footers (~27 k)."""
-    hours_ms = int(hours) * 3600 * 1000
-    cycle_by_venue, hourly_by_venue, daily = _classify_files()
-
-    cycle_flat = [it for items in cycle_by_venue.values() for it in items]
-    hourly_flat = [it for items in hourly_by_venue.values() for it in items]
-
-    if not cycle_flat and not hourly_flat:
-        return list(daily)
-
-    # Window anchor = freshest available ts. Prefer a cycle file when
-    # present (per-cycle ms is always >= the latest hourly bucket start).
-    anchor_ms = (
-        max(t for t, _ in cycle_flat) if cycle_flat
-        else max(t for t, _ in hourly_flat)
-    )
-    cutoff_ms = anchor_ms - hours_ms
-
-    selected = [p for t, p in cycle_flat if t >= cutoff_ms]
-    # An hourly bucket [t, t+1h) intersects [cutoff, ∞) iff t+1h > cutoff.
-    selected.extend(p for t, p in hourly_flat if t + 3_600_000 > cutoff_ms)
-    selected.extend(daily)
-    return selected
+# `store.py` owns file-naming conventions, the file enumeration walk, and
+# the compaction-race retry pattern (shared with compact.py and any
+# future non-Streamlit consumer). The wrappers below add Streamlit's
+# `@st.cache_data` so fragment-driven refreshes hit a process-local cache
+# instead of re-querying the parquet store on every fragment tick.
 
 
 @st.cache_data(ttl=30)
@@ -216,35 +72,26 @@ def _latest_snapshot() -> pd.DataFrame:
     """One row per (exchange, symbol_canonical) — most recent observation,
     with global oi_rank descending by open_interest_usd. Null OI sorts to
     the bottom of the rank order."""
-    # Two attempts to absorb a compaction-race file disappearance; see the
-    # 'Compaction race' note above. repr() on a list[str] yields a SQL list
-    # literal — file paths come from FUNDING_DIR.glob (filesystem-controlled,
-    # never user input) so direct embedding is safe.
-    for attempt in (0, 1):
-        files = _latest_files()
-        if not files:
-            return pd.DataFrame()
-        db = duckdb.connect()
-        try:
-            return db.sql(f"""
-                with latest as (
-                    select * from read_parquet({files!r}, union_by_name=true)
-                    qualify row_number() over (partition by exchange, symbol_canonical
-                                               order by ts_utc desc) = 1
-                )
-                select *,
-                       row_number() over (
-                           order by coalesce(open_interest_usd, 0) desc, exchange
-                       ) as oi_rank
-                from latest
-            """).df()
-        except duckdb.IOException as e:
-            if attempt == 1 or "Cannot open file" not in str(e):
-                raise
-            log.info("compaction race in _latest_snapshot; retrying")
-        finally:
-            db.close()
-    return pd.DataFrame()  # unreachable; keeps type-checker happy
+    # repr() on a list[str] yields a SQL list literal — file paths come
+    # from FUNDING_DIR.glob (filesystem-controlled, never user input), so
+    # direct embedding is safe.
+    def query(db, files):
+        return db.sql(f"""
+            with latest as (
+                select * from read_parquet({files!r}, union_by_name=true)
+                qualify row_number() over (partition by exchange, symbol_canonical
+                                           order by ts_utc desc) = 1
+            )
+            select *,
+                   row_number() over (
+                       order by coalesce(open_interest_usd, 0) desc, exchange
+                   ) as oi_rank
+            from latest
+        """).df()
+
+    return store.read_with_retry(
+        store.latest_files, query, retry_label="_latest_snapshot"
+    )
 
 
 @st.cache_data(ttl=60)
@@ -260,37 +107,30 @@ def _history(symbol: str, hours: int) -> pd.DataFrame:
     # wild). Python ints are arbitrary precision, and passing the result
     # as a bound parameter has DuckDB infer INT64.
     offset_ms = int(hours) * 3600 * 1000
-    for attempt in (0, 1):
-        files = _history_files(hours)
-        if not files:
-            return pd.DataFrame()
-        db = duckdb.connect()
-        try:
-            # Register the narrow file set as a temp view so the WHERE clause's
-            # `(select max(ts_utc) from f)` subquery has something to reference.
-            db.sql(
-                f"create temp view f as "
-                f"select * from read_parquet({files!r}, union_by_name=true)"
-            )
-            return db.execute(
-                """
-                select ts_utc, exchange, funding_rate, funding_interval_h,
-                       next_funding_ts, predicted_rate,
-                       apy_norm * 100 as apy_pct, mark_price, volume_24h_usd
-                from f
-                where symbol_canonical = ?
-                  and ts_utc >= (select max(ts_utc) from f) - ?
-                order by ts_utc
-            """,
-                [symbol, offset_ms],
-            ).fetchdf()
-        except duckdb.IOException as e:
-            if attempt == 1 or "Cannot open file" not in str(e):
-                raise
-            log.info("compaction race in _history; retrying")
-        finally:
-            db.close()
-    return pd.DataFrame()  # unreachable; keeps type-checker happy
+
+    def query(db, files):
+        # Register the narrow file set as a temp view so the WHERE clause's
+        # `(select max(ts_utc) from f)` subquery has something to reference.
+        db.sql(
+            f"create temp view f as "
+            f"select * from read_parquet({files!r}, union_by_name=true)"
+        )
+        return db.execute(
+            """
+            select ts_utc, exchange, funding_rate, funding_interval_h,
+                   next_funding_ts, predicted_rate,
+                   apy_norm * 100 as apy_pct, mark_price, volume_24h_usd
+            from f
+            where symbol_canonical = ?
+              and ts_utc >= (select max(ts_utc) from f) - ?
+            order by ts_utc
+        """,
+            [symbol, offset_ms],
+        ).fetchdf()
+
+    return store.read_with_retry(
+        lambda: store.history_files(hours), query, retry_label="_history"
+    )
 
 
 # --------------------------------------------------------------------------
