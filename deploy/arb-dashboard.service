@@ -18,6 +18,11 @@ Restart=on-failure
 RestartSec=10s
 StandardOutput=journal
 StandardError=journal
+# Defensive belt — the dashboard's narrow-file-list snapshot path stays
+# well under 1024 open files, but a future scale-out (more venues, denser
+# cadence, deeper fallback K) shouldn't hit the default ulimit cliff.
+# 65536 matches systemd's modern recommended ceiling for service units.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

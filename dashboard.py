@@ -29,7 +29,9 @@ Funding-arb directionality:
 """
 
 import logging
+import re
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import duckdb
@@ -47,14 +49,81 @@ logging.getLogger("tornado.general").setLevel(logging.ERROR)
 
 _GLOB = str(FUNDING_DIR / "**" / "*.parquet").replace("\\", "/")
 
+# Per-cycle parquet files are named `<VENUE>_<ms_ts>.parquet`; compacted
+# prior-day files use a `_daily` suffix instead. The regex matches only the
+# per-cycle form so we can sort by the embedded ms timestamp; daily files
+# fall through to a separate bucket and always participate in the snapshot
+# read as a deeper fallback.
+_CYCLE_FILE_RE = re.compile(r"([A-Z\.]+)_(\d+)\.parquet$")
+
 
 # --------------------------------------------------------------------------
 # data access
 # --------------------------------------------------------------------------
+#
+# Two read paths over the same Parquet store, deliberately decoupled:
+#
+# - `_db()` exposes a wide-glob view (`f`) used by user-driven queries
+#   (`_history()`). Cache-miss latency on this path is dominated by
+#   DuckDB walking every parquet footer in today's un-compacted partition
+#   (~26 k files), which can also exhaust the default 1024 FD limit on
+#   full-fan-out aggregates. Acceptable for a one-shot history fetch
+#   that the user explicitly triggered.
+#
+# - `_latest_snapshot()` is the hot path — every 10 s auto-refresh in
+#   the header / anomalies / spreads fragments calls into it. It reads
+#   only a narrow file list (`_latest_files()`) on a *fresh* DuckDB
+#   connection, bypassing `_db()` entirely. Two reasons:
+#     * The wide glob's metadata scan dominates; pruning to the K most
+#       recent cycle files per venue collapses 26 k+ files to a few
+#       hundred without changing query semantics (verified empirically).
+#     * Streamlit reruns can interrupt a query mid-flight; the shared
+#       `_db()` connection could be left in a bad state by such an
+#       interrupt. A fresh connection per call isolates that blast
+#       radius to a single snapshot fetch.
+
+
+def _latest_files(k: int = 20) -> list[str]:
+    """Return only the parquet files needed to build a 'latest snapshot per
+    (exchange, symbol)' view, drastically pruning the un-compacted per-cycle
+    files in today's partition.
+
+    For each venue we keep the K most recent per-cycle files (sorted by the
+    ms timestamp embedded in the filename) plus all `*_daily.parquet`
+    compacted files from prior days. 13 venues × K + ~13 daily files is a
+    few hundred paths total — every row that `qualify rn=1 over (exchange,
+    symbol)` could possibly select stays present, with the daily files
+    acting as the deeper fallback for any pair that's been intermittently
+    dropped from a venue's batch responses for longer than K cycles.
+
+    K=20 covers ~10 minutes of cycle history at 30 s cadence; raise it if
+    you ever observe pairs disappearing from the snapshot after a venue's
+    transient drop.
+    """
+    by_venue: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    daily: list[str] = []
+    for path in FUNDING_DIR.glob("**/*.parquet"):
+        # Forward slashes for cross-platform DuckDB compatibility — Path
+        # stringifies with backslashes on Windows, which we don't want
+        # leaking into a SQL string literal.
+        spath = str(path).replace("\\", "/")
+        m = _CYCLE_FILE_RE.search(path.name)
+        if m:
+            by_venue[m.group(1)].append((int(m.group(2)), spath))
+        else:
+            daily.append(spath)
+
+    selected = list(daily)
+    for items in by_venue.values():
+        items.sort(reverse=True)
+        selected.extend(p for _, p in items[:k])
+    return selected
 
 
 @st.cache_resource
 def _db():
+    """Shared DuckDB connection over the wide parquet glob. Used by
+    user-driven queries (`_history()`); not on the auto-refresh hot path."""
     db = duckdb.connect()
     db.sql(f"""create or replace view f as
                select * from read_parquet('{_GLOB}',
@@ -67,19 +136,33 @@ def _db():
 def _latest_snapshot() -> pd.DataFrame:
     """One row per (exchange, symbol_canonical) — most recent observation,
     with global oi_rank descending by open_interest_usd. Null OI sorts to
-    the bottom of the rank order."""
-    return _db().sql("""
-        with latest as (
-            select * from f
-            qualify row_number() over (partition by exchange, symbol_canonical
-                                       order by ts_utc desc) = 1
-        )
-        select *,
-               row_number() over (
-                   order by coalesce(open_interest_usd, 0) desc, exchange
-               ) as oi_rank
-        from latest
-    """).df()
+    the bottom of the rank order.
+
+    Hot path. Reads a narrow file list on a fresh DuckDB connection — see
+    the data-access docstring at the top of this section for the rationale."""
+    files = _latest_files()
+    if not files:
+        return pd.DataFrame()
+    # repr() on a list[str] yields a SQL-compatible list literal. File paths
+    # come from `FUNDING_DIR.glob` (filesystem-controlled, never user input),
+    # so embedding them directly is safe and avoids the prepared-statement
+    # path for read_parquet's variadic file list.
+    db = duckdb.connect()
+    try:
+        return db.sql(f"""
+            with latest as (
+                select * from read_parquet({files!r}, union_by_name=true)
+                qualify row_number() over (partition by exchange, symbol_canonical
+                                           order by ts_utc desc) = 1
+            )
+            select *,
+                   row_number() over (
+                       order by coalesce(open_interest_usd, 0) desc, exchange
+                   ) as oi_rank
+            from latest
+        """).df()
+    finally:
+        db.close()
 
 
 @st.cache_data(ttl=10)
