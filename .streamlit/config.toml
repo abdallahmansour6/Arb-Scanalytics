@@ -1,0 +1,22 @@
+# Streamlit server configuration for the scanner dashboard.
+#
+# Why this file exists: by default Streamlit auto-increments the port if
+# 8501 is taken (8502, 8503, ...), which silently lets a second
+# `streamlit run dashboard.py` spawn alongside an existing instance.
+# Pinning the port makes a duplicate invocation fail immediately with
+# "Address already in use" — single-operator tool, only one instance
+# should ever be running.
+#
+# Quick ops:
+#   pgrep -af 'streamlit run dashboard'      # is one running?
+#   pkill -f 'streamlit run dashboard'       # stop the running one
+
+[server]
+port = 8501
+# headless=true skips the "open browser" stdout banner; the user opens
+# the URL themselves via VSCode Remote-SSH's port-forward toast.
+headless = true
+
+[browser]
+# Skip the first-run "share telemetry?" prompt.
+gatherUsageStats = false
