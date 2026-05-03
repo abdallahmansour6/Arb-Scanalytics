@@ -52,6 +52,7 @@ _GLOB = str(FUNDING_DIR / "**" / "*.parquet").replace("\\", "/")
 # data access
 # --------------------------------------------------------------------------
 
+
 @st.cache_resource
 def _db():
     db = duckdb.connect()
@@ -88,7 +89,10 @@ def _history(symbol: str, hours: int) -> pd.DataFrame:
     # wild). Python ints are arbitrary precision, and passing the result
     # as a bound parameter has DuckDB infer INT64.
     offset_ms = int(hours) * 3600 * 1000
-    return _db().execute("""
+    return (
+        _db()
+        .execute(
+            """
         select ts_utc, exchange, funding_rate, funding_interval_h,
                next_funding_ts, predicted_rate,
                apy_norm * 100 as apy_pct, mark_price, volume_24h_usd
@@ -96,12 +100,17 @@ def _history(symbol: str, hours: int) -> pd.DataFrame:
         where symbol_canonical = ?
           and ts_utc >= (select max(ts_utc) from f) - ?
         order by ts_utc
-    """, [symbol, offset_ms]).fetchdf()
+    """,
+            [symbol, offset_ms],
+        )
+        .fetchdf()
+    )
 
 
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -125,72 +134,106 @@ def _freshness_dot(age_s: float) -> str:
 
 def _column_config(extra: dict | None = None) -> dict:
     cfg = {
-        "exchange":           st.column_config.TextColumn("Exchange"),
-        "symbol_canonical":   st.column_config.TextColumn("Symbol"),
-        "base_coin":          st.column_config.TextColumn(
-                                  "Base",
-                                  help="Underlying token, with multiplier prefix "
-                                       "(1000/1M/1000000) stripped. Used as the "
-                                       "cross-venue grouping key in the spreads "
-                                       "view, since the same coin can appear under "
-                                       "different contract-size multipliers across "
-                                       "venues (e.g. CHEEMS / 1000CHEEMS / "
-                                       "1000000CHEEMS are all the same underlying)."),
-        "short_symbol":       st.column_config.TextColumn(
-                                  "Short symbol",
-                                  help="The exact venue-specific contract you'd "
-                                       "fire on the short leg (matches the venue's "
-                                       "own listing, including any multiplier prefix)."),
-        "long_symbol":        st.column_config.TextColumn(
-                                  "Long symbol",
-                                  help="The exact venue-specific contract you'd "
-                                       "fire on the long leg."),
-        "funding_rate":       st.column_config.NumberColumn("Rate (next epoch)", format="%.6f"),
-        "predicted_rate":     st.column_config.NumberColumn("Forecast (cycle after)", format="%.6f"),
+        "exchange": st.column_config.TextColumn("Exchange"),
+        "symbol_canonical": st.column_config.TextColumn("Symbol"),
+        "base_coin": st.column_config.TextColumn(
+            "Base",
+            help="Underlying token, with multiplier prefix "
+            "(1000/1M/1000000) stripped. Used as the "
+            "cross-venue grouping key in the spreads "
+            "view, since the same coin can appear under "
+            "different contract-size multipliers across "
+            "venues (e.g. CHEEMS / 1000CHEEMS / "
+            "1000000CHEEMS are all the same underlying).",
+        ),
+        "short_symbol": st.column_config.TextColumn(
+            "Short symbol",
+            help="The exact venue-specific contract you'd "
+            "fire on the short leg (matches the venue's "
+            "own listing, including any multiplier prefix).",
+        ),
+        "long_symbol": st.column_config.TextColumn(
+            "Long symbol",
+            help="The exact venue-specific contract you'd " "fire on the long leg.",
+        ),
+        "funding_rate": st.column_config.NumberColumn(
+            "Rate (next epoch)", format="%.6f"
+        ),
+        "predicted_rate": st.column_config.NumberColumn(
+            "Forecast (cycle after)", format="%.6f"
+        ),
         "funding_interval_h": st.column_config.NumberColumn("Cycle h", format="%.0f"),
-        "cycles_h":           st.column_config.TextColumn(
-                                  "Cycles h",
-                                  help="Funding-cycle hours at the short / long legs. "
-                                       "Single value if both legs match."),
-        "apy_pct":            st.column_config.NumberColumn("APY %", format="%.1f"),
-        "settles_in_min":     st.column_config.NumberColumn("Settles in (m)", format="%.0f"),
-        "vol_musd":           st.column_config.NumberColumn("Vol $M", format="%.1f"),
-        "oi_musd":            st.column_config.NumberColumn("OI $M", format="%.1f"),
-        "oi_rank":            st.column_config.NumberColumn("OI rank", format="%d",
-                                                            help="1 = highest OI globally"),
-        "listings":           st.column_config.NumberColumn(
-                                  "Listings", format="%d",
-                                  help="Distinct venues that list this base_coin "
-                                       "in any multiplier variant. "
-                                       "Filter-independent — does NOT change "
-                                       "when you tweak the OI / volume / "
-                                       "settlement filters."),
+        "cycles_h": st.column_config.TextColumn(
+            "Cycles h",
+            help="Funding-cycle hours at the short / long legs. "
+            "Single value if both legs match.",
+        ),
+        "apy_pct": st.column_config.NumberColumn("APY %", format="%.1f"),
+        "settles_in_min": st.column_config.NumberColumn(
+            "Settles in (m)", format="%.0f"
+        ),
+        "vol_musd": st.column_config.NumberColumn("Vol $M", format="%.1f"),
+        "oi_musd": st.column_config.NumberColumn("OI $M", format="%.1f"),
+        "oi_rank": st.column_config.NumberColumn(
+            "OI rank", format="%d", help="1 = highest OI globally"
+        ),
+        "listings": st.column_config.NumberColumn(
+            "Listings",
+            format="%d",
+            help="Distinct venues that list this base_coin "
+            "in any multiplier variant. "
+            "Filter-independent — does NOT change "
+            "when you tweak the OI / volume / "
+            "settlement filters.",
+        ),
         # Per-leg columns (Spreads tab) — these refer to the exact two
         # venues you would actually trade against (short = APY-high,
         # long = APY-low).
-        "venue_short":        st.column_config.TextColumn(
-                                  "Short venue",
-                                  help="Higher-APY venue. Short here: positive funding => shorts receive."),
-        "venue_long":         st.column_config.TextColumn(
-                                  "Long venue",
-                                  help="Lower-APY venue. Long here: negative funding => longs receive."),
-        "short_apy_pct":      st.column_config.NumberColumn("Short APY %", format="%.1f"),
-        "long_apy_pct":       st.column_config.NumberColumn("Long APY %", format="%.1f"),
-        "short_oi_rank":      st.column_config.NumberColumn("Short OI rank", format="%d"),
-        "long_oi_rank":       st.column_config.NumberColumn("Long OI rank", format="%d"),
-        "short_vol_musd":     st.column_config.NumberColumn("Short vol $M", format="%.1f"),
-        "long_vol_musd":      st.column_config.NumberColumn("Long vol $M", format="%.1f"),
-        "short_settles_in":   st.column_config.NumberColumn("Short settles (m)", format="%.0f"),
-        "long_settles_in":    st.column_config.NumberColumn("Long settles (m)",  format="%.0f"),
-        "delta_apy_pct":      st.column_config.NumberColumn("ΔAPY %", format="%.1f"),
+        "venue_short": st.column_config.TextColumn(
+            "Short venue",
+            help="Higher-APY venue. Short here: positive funding => shorts receive.",
+        ),
+        "venue_long": st.column_config.TextColumn(
+            "Long venue",
+            help="Lower-APY venue. Long here: negative funding => longs receive.",
+        ),
+        "short_apy_pct": st.column_config.NumberColumn("Short APY %", format="%.1f"),
+        "long_apy_pct": st.column_config.NumberColumn("Long APY %", format="%.1f"),
+        "short_oi_rank": st.column_config.NumberColumn("Short OI rank", format="%d"),
+        "long_oi_rank": st.column_config.NumberColumn("Long OI rank", format="%d"),
+        "short_vol_musd": st.column_config.NumberColumn("Short vol $M", format="%.1f"),
+        "long_vol_musd": st.column_config.NumberColumn("Long vol $M", format="%.1f"),
+        "short_settles_in": st.column_config.NumberColumn(
+            "Short settles (m)", format="%.0f"
+        ),
+        "long_settles_in": st.column_config.NumberColumn(
+            "Long settles (m)", format="%.0f"
+        ),
+        "delta_apy_pct": st.column_config.NumberColumn("ΔAPY %", format="%.1f"),
+        "entry_basis_bps": st.column_config.NumberColumn(
+            "Entry basis bps",
+            format="%.1f",
+            help="Estimated entry basis at current snapshot prices: "
+            "(short_price − long_price) / mid × 10000, with each "
+            "leg's price = coalesce(mark_price, last_price). "
+            "Engine-convention sign (basis = received − paid): "
+            "positive = credit (you collect entering), "
+            "negative = cost (you pay). Mirrors --min-entry-basis-bps "
+            "directly — a row showing −15 means entering would cost "
+            "~15 bps; a floor of −25 still admits it. "
+            "Computed from mid-style prices, not L2 VWAP — "
+            "systematically ~Σ half-spreads optimistic vs. realized basis "
+            "(sub-bp on liquid pairs, 10–50 bps on small-caps).",
+        ),
     }
     if extra:
         cfg.update(extra)
     return cfg
 
 
-def _filter_inputs(prefix: str, snapshot: pd.DataFrame, *,
-                    include_min_venues: bool = False) -> None:
+def _filter_inputs(
+    prefix: str, snapshot: pd.DataFrame, *, include_min_venues: bool = False
+) -> None:
     """Render filter widgets in semantic, bordered groups. Values land in
     st.session_state under {prefix}_* keys; fragments read them from there.
 
@@ -205,7 +248,7 @@ def _filter_inputs(prefix: str, snapshot: pd.DataFrame, *,
 
     # Outer weights ≈ relative content widths.
     if include_min_venues:
-        weights = [2.0, 2.6, 0.9, 0.6]   # OI · Vol · Settle · Min venues
+        weights = [2.0, 2.6, 0.9, 0.6]  # OI · Vol · Settle · Min venues
     else:
         weights = [2.0, 2.6, 0.9]
     groups = st.columns(weights, gap="small")
@@ -216,13 +259,21 @@ def _filter_inputs(prefix: str, snapshot: pd.DataFrame, *,
             sub = st.columns(2, gap="small")
             with sub[0]:
                 st.number_input(
-                    "From", min_value=1, max_value=total, value=1, step=10,
+                    "From",
+                    min_value=1,
+                    max_value=total,
+                    value=1,
+                    step=10,
                     key=f"{prefix}_oi_min",
                 )
             with sub[1]:
                 st.number_input(
-                    "To", min_value=1, max_value=total, value=default_oi_max,
-                    step=10, key=f"{prefix}_oi_max",
+                    "To",
+                    min_value=1,
+                    max_value=total,
+                    value=default_oi_max,
+                    step=10,
+                    key=f"{prefix}_oi_max",
                 )
             st.caption(
                 f"Rank 1 = highest OI · rank {total:,} = lowest. "
@@ -235,25 +286,34 @@ def _filter_inputs(prefix: str, snapshot: pd.DataFrame, *,
             sub = st.columns(2, gap="small")
             with sub[0]:
                 st.number_input(
-                    "Min", min_value=0.0, value=0.5, step=1.0,
+                    "Min",
+                    min_value=0.0,
+                    value=0.5,
+                    step=1.0,
                     key=f"{prefix}_vol_min",
                 )
             with sub[1]:
                 st.number_input(
-                    "Max", min_value=0.0, value=default_vol_max, step=10.0,
+                    "Max",
+                    min_value=0.0,
+                    value=default_vol_max,
+                    step=10.0,
                     key=f"{prefix}_vol_max",
                 )
             st.caption(
-                f"Smallest pair in dataset: $0M · "
-                f"largest: ${max_vol_musd:,.0f}M"
+                f"Smallest pair in dataset: $0M · " f"largest: ${max_vol_musd:,.0f}M"
             )
 
     with groups[2]:
         with st.container(border=True):
             st.markdown("**Settlement**")
             st.number_input(
-                "Within (m, 0 = off)", min_value=0, max_value=720,
-                value=0, step=15, key=f"{prefix}_settles_max",
+                "Within (m, 0 = off)",
+                min_value=0,
+                max_value=720,
+                value=0,
+                step=15,
+                key=f"{prefix}_settles_max",
             )
 
     if include_min_venues:
@@ -261,7 +321,10 @@ def _filter_inputs(prefix: str, snapshot: pd.DataFrame, *,
             with st.container(border=True):
                 st.markdown("**Cross-venue**")
                 st.number_input(
-                    "Min venues", min_value=2, max_value=13, value=2,
+                    "Min venues",
+                    min_value=2,
+                    max_value=13,
+                    value=2,
                     key=f"{prefix}_min_venues",
                 )
 
@@ -280,6 +343,7 @@ def _apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
 # auto-refreshing fragments
 # --------------------------------------------------------------------------
 
+
 @st.fragment(run_every=10)
 def render_header():
     snapshot = _latest_snapshot()
@@ -294,8 +358,11 @@ def render_header():
     c1.metric("Venues", snapshot["exchange"].nunique())
     c2.metric("Symbols", snapshot["symbol_canonical"].nunique())
     c3.metric("Pairs", f"{len(snapshot):,}")
-    c4.metric(f"{dot} Latest cycle", f"{age_s:.0f}s ago",
-              help="Auto-refreshes every 15 s. Green <2 cycles, yellow <4, red older.")
+    c4.metric(
+        f"{dot} Latest cycle",
+        f"{age_s:.0f}s ago",
+        help="Auto-refreshes every 15 s. Green <2 cycles, yellow <4, red older.",
+    )
     if c5.button("Refresh now", width="stretch"):
         st.cache_data.clear()
         st.rerun()
@@ -322,16 +389,31 @@ def render_anomalies():
     df["apy_pct"] = df["apy_norm"] * 100
     df["vol_musd"] = df["volume_24h_usd"] / 1e6
     df["oi_musd"] = df["open_interest_usd"] / 1e6
-    df = (df.assign(_abs=df["apy_pct"].abs())
-            .sort_values("_abs", ascending=False).drop("_abs", axis=1))
+    df = (
+        df.assign(_abs=df["apy_pct"].abs())
+        .sort_values("_abs", ascending=False)
+        .drop("_abs", axis=1)
+    )
 
     # "Forecast (cycle after)" column moved to the rightmost — mostly null.
-    cols = ["exchange", "symbol_canonical", "funding_rate", "funding_interval_h",
-            "apy_pct", "settles_in_min", "vol_musd", "oi_musd", "oi_rank",
-            "predicted_rate"]
+    cols = [
+        "exchange",
+        "symbol_canonical",
+        "funding_rate",
+        "funding_interval_h",
+        "apy_pct",
+        "settles_in_min",
+        "vol_musd",
+        "oi_musd",
+        "oi_rank",
+        "predicted_rate",
+    ]
     st.caption(f"{len(df):,} pairs match filters")
     st.dataframe(
-        df[cols], width="stretch", hide_index=True, height=600,
+        df[cols],
+        width="stretch",
+        hide_index=True,
+        height=600,
         column_config=_column_config(),
     )
 
@@ -383,42 +465,63 @@ def render_spreads():
     agg = grouped.agg(
         n_venues_filtered=("exchange", "count"),
     ).reset_index()
-    agg["listings"]          = agg["base_coin"].map(listings)
-    agg["venue_short"]       = short_rows["exchange"].values
-    agg["short_symbol"]      = short_rows["symbol_canonical"].values
-    agg["short_apy_pct"]     = short_rows["apy_norm"].values * 100
-    agg["short_oi_rank"]     = short_rows["oi_rank"].values
-    agg["short_vol_musd"]    = short_rows["volume_24h_usd"].values / 1e6
-    agg["short_settles_in"]  = short_rows["settles_in_min"].values
-    agg["venue_long"]        = long_rows["exchange"].values
-    agg["long_symbol"]       = long_rows["symbol_canonical"].values
-    agg["long_apy_pct"]      = long_rows["apy_norm"].values * 100
-    agg["long_oi_rank"]      = long_rows["oi_rank"].values
-    agg["long_vol_musd"]     = long_rows["volume_24h_usd"].values / 1e6
-    agg["long_settles_in"]   = long_rows["settles_in_min"].values
+    agg["listings"] = agg["base_coin"].map(listings)
+    agg["venue_short"] = short_rows["exchange"].values
+    agg["short_symbol"] = short_rows["symbol_canonical"].values
+    agg["short_apy_pct"] = short_rows["apy_norm"].values * 100
+    agg["short_oi_rank"] = short_rows["oi_rank"].values
+    agg["short_vol_musd"] = short_rows["volume_24h_usd"].values / 1e6
+    agg["short_settles_in"] = short_rows["settles_in_min"].values
+    agg["venue_long"] = long_rows["exchange"].values
+    agg["long_symbol"] = long_rows["symbol_canonical"].values
+    agg["long_apy_pct"] = long_rows["apy_norm"].values * 100
+    agg["long_oi_rank"] = long_rows["oi_rank"].values
+    agg["long_vol_musd"] = long_rows["volume_24h_usd"].values / 1e6
+    agg["long_settles_in"] = long_rows["settles_in_min"].values
 
     short_h = short_rows["funding_interval_h"].astype(float).values
     long_h = long_rows["funding_interval_h"].astype(float).values
     agg["cycles_h"] = [
-        f"{int(s)}" if s == l else f"{int(s)}/{int(l)}"
-        for s, l in zip(short_h, long_h)
+        f"{int(s)}" if s == l else f"{int(s)}/{int(l)}" for s, l in zip(short_h, long_h)
     ]
+
+    # Entry basis bps — engine-convention (basis = received − paid). Coalesce
+    # to last_price for venues that don't expose mark (BITMART/HTX/OKX per
+    # FIELD_NOTES); NaN propagates if both are missing on either leg.
+    short_p = short_rows["mark_price"].fillna(short_rows["last_price"]).values
+    long_p = long_rows["mark_price"].fillna(long_rows["last_price"]).values
+    mid = (short_p + long_p) / 2
+    agg["entry_basis_bps"] = (short_p - long_p) / mid * 10000
 
     agg = agg[agg["n_venues_filtered"] >= min_venues].copy()
     agg["delta_apy_pct"] = agg["short_apy_pct"] - agg["long_apy_pct"]
     agg = agg.sort_values("delta_apy_pct", ascending=False)
 
     cols = [
-        "base_coin", "listings",
-        "delta_apy_pct", "cycles_h",
-        "venue_short", "short_symbol", "short_apy_pct", "short_oi_rank",
-        "short_vol_musd", "short_settles_in",
-        "venue_long",  "long_symbol",  "long_apy_pct",  "long_oi_rank",
-        "long_vol_musd",  "long_settles_in",
+        "base_coin",
+        "listings",
+        "delta_apy_pct",
+        "entry_basis_bps",
+        "cycles_h",
+        "venue_short",
+        "short_symbol",
+        "short_apy_pct",
+        "short_oi_rank",
+        "short_vol_musd",
+        "short_settles_in",
+        "venue_long",
+        "long_symbol",
+        "long_apy_pct",
+        "long_oi_rank",
+        "long_vol_musd",
+        "long_settles_in",
     ]
     st.caption(f"{len(agg):,} symbols match filters")
     st.dataframe(
-        agg[cols], width="stretch", hide_index=True, height=600,
+        agg[cols],
+        width="stretch",
+        hide_index=True,
+        height=600,
         column_config=_column_config(),
     )
 
@@ -427,9 +530,21 @@ def render_spreads():
 # Symbol history (no auto-refresh; user-driven)
 # --------------------------------------------------------------------------
 
-_PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-            "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-            "#aec7e8", "#ffbb78", "#98df8a"]
+_PALETTE = [
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+    "#aec7e8",
+    "#ffbb78",
+    "#98df8a",
+]
 
 
 def _color_for(venue: str, all_venues: list[str]) -> str:
@@ -437,26 +552,38 @@ def _color_for(venue: str, all_venues: list[str]) -> str:
     return _PALETTE[sorted(all_venues).index(venue) % len(_PALETTE)]
 
 
-_RANGE_BUTTONS = dict(buttons=[
-    dict(count=1,  label="1h",  step="hour", stepmode="backward"),
-    dict(count=6,  label="6h",  step="hour", stepmode="backward"),
-    dict(count=24, label="1d",  step="hour", stepmode="backward"),
-    dict(count=72, label="3d",  step="hour", stepmode="backward"),
-    dict(count=7,  label="1w",  step="day",  stepmode="backward"),
-    dict(step="all", label="All"),
-])
+_RANGE_BUTTONS = dict(
+    buttons=[
+        dict(count=1, label="1h", step="hour", stepmode="backward"),
+        dict(count=6, label="6h", step="hour", stepmode="backward"),
+        dict(count=24, label="1d", step="hour", stepmode="backward"),
+        dict(count=72, label="3d", step="hour", stepmode="backward"),
+        dict(count=7, label="1w", step="day", stepmode="backward"),
+        dict(step="all", label="All"),
+    ]
+)
 
 
-def _venue_timeframe_row(prefix: str, venues_avail: list[str], *,
-                          default_venues: list[str], default_hours: int = 24
-                          ) -> tuple[list[str], int]:
+def _venue_timeframe_row(
+    prefix: str,
+    venues_avail: list[str],
+    *,
+    default_venues: list[str],
+    default_hours: int = 24,
+) -> tuple[list[str], int]:
     cols = st.columns([3, 1])
     chosen = cols[0].multiselect(
-        "Venues", venues_avail, default=default_venues, key=f"{prefix}_venues",
+        "Venues",
+        venues_avail,
+        default=default_venues,
+        key=f"{prefix}_venues",
     )
     hours = cols[1].number_input(
-        "Fetch last N hours", min_value=1, value=default_hours,
-        step=1, key=f"{prefix}_hours",
+        "Fetch last N hours",
+        min_value=1,
+        value=default_hours,
+        step=1,
+        key=f"{prefix}_hours",
         help=(
             "Number of hours of history to pull from disk. Bounded only by "
             "how long the collector has been running. Larger windows mean "
@@ -470,8 +597,7 @@ def _venue_timeframe_row(prefix: str, venues_avail: list[str], *,
     return chosen, hours
 
 
-def _render_chart_apy(sym: str, chosen: list[str], hours: int,
-                      all_venues: list[str]):
+def _render_chart_apy(sym: str, chosen: list[str], hours: int, all_venues: list[str]):
     """Chart 1: live drift of upcoming-epoch rate, annualized as APY %.
     Cross-venue magnitudes are directly comparable. Each polled cycle is
     a sample point; step-changes mark settlement boundaries where the
@@ -491,30 +617,34 @@ def _render_chart_apy(sym: str, chosen: list[str], hours: int,
         d = hist[hist["exchange"] == venue].sort_values("ts_utc")
         if d.empty:
             continue
-        fig.add_trace(go.Scatter(
-            x=d["ts_utc"], y=d["apy_pct"],
-            mode="lines+markers", name=venue,
-            line=dict(color=_color_for(venue, all_venues), width=1.5),
-            marker=dict(size=4),
-            # x-axis label is already shown in the unified hover header; the
-            # template only needs the venue/value row.
-            hovertemplate=venue + ": %{y:.1f}%%<extra></extra>",
-        ))
-    fig.update_xaxes(rangeselector=_RANGE_BUTTONS,
-                     rangeslider=dict(visible=False))
+        fig.add_trace(
+            go.Scatter(
+                x=d["ts_utc"],
+                y=d["apy_pct"],
+                mode="lines+markers",
+                name=venue,
+                line=dict(color=_color_for(venue, all_venues), width=1.5),
+                marker=dict(size=4),
+                # x-axis label is already shown in the unified hover header; the
+                # template only needs the venue/value row.
+                hovertemplate=venue + ": %{y:.1f}%%<extra></extra>",
+            )
+        )
+    fig.update_xaxes(rangeselector=_RANGE_BUTTONS, rangeslider=dict(visible=False))
     fig.update_yaxes(title_text="APY %")
     fig.update_layout(
-        height=480, hovermode="x unified",
+        height=480,
+        hovermode="x unified",
         margin=dict(l=20, r=20, t=40, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="right", x=1),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig, width="stretch")
     st.caption(f"{len(hist):,} observations across {hist['exchange'].nunique()} venues")
 
 
-def _render_chart_per_venue(sym: str, chosen: list[str], hours: int,
-                             all_venues: list[str]):
+def _render_chart_per_venue(
+    sym: str, chosen: list[str], hours: int, all_venues: list[str]
+):
     """Chart 2: per-venue raw rate as small multiples.
 
     One row per venue, shared time axis, independent y-axis per venue
@@ -541,7 +671,9 @@ def _render_chart_per_venue(sym: str, chosen: list[str], hours: int,
         return
 
     fig = make_subplots(
-        rows=len(visible), cols=1, shared_xaxes=True,
+        rows=len(visible),
+        cols=1,
+        shared_xaxes=True,
         vertical_spacing=0.04,
         subplot_titles=tuple(visible),
     )
@@ -553,24 +685,35 @@ def _render_chart_per_venue(sym: str, chosen: list[str], hours: int,
         color = _color_for(venue, all_venues)
         cycle_h = int(d["funding_interval_h"].iloc[-1] or 0)
 
-        fig.add_trace(go.Scatter(
-            x=d["ts_utc"], y=d["funding_rate"],
-            mode="lines+markers", name=venue, showlegend=False,
-            line=dict(color=color, width=1.5), marker=dict(size=3),
-            # x-axis label already shown in unified hover header. ":.4%" tells
-            # plotly's d3-format to multiply by 100 and append "%", so a raw
-            # rate of -0.000034 renders as "-0.0034%".
-            hovertemplate=venue + ": %{y:.4%}<extra></extra>",
-        ), row=i, col=1)
+        fig.add_trace(
+            go.Scatter(
+                x=d["ts_utc"],
+                y=d["funding_rate"],
+                mode="lines+markers",
+                name=venue,
+                showlegend=False,
+                line=dict(color=color, width=1.5),
+                marker=dict(size=3),
+                # x-axis label already shown in unified hover header. ":.4%" tells
+                # plotly's d3-format to multiply by 100 and append "%", so a raw
+                # rate of -0.000034 renders as "-0.0034%".
+                hovertemplate=venue + ": %{y:.4%}<extra></extra>",
+            ),
+            row=i,
+            col=1,
+        )
 
         # Boundary vlines — one per unique next_funding_ts in the window.
         boundaries = (
             pd.to_datetime(d["next_funding_ts"], unit="ms", utc=True)
-              .dropna().drop_duplicates().sort_values()
+            .dropna()
+            .drop_duplicates()
+            .sort_values()
         )
         for b in boundaries:
-            fig.add_vline(x=b, line_dash="dot", line_color="gray",
-                          opacity=0.45, row=i, col=1)
+            fig.add_vline(
+                x=b, line_dash="dot", line_color="gray", opacity=0.45, row=i, col=1
+            )
 
         # Per-panel volatility annotation (top-right of each panel)
         stdev = float(d["funding_rate"].std() or 0.0)
@@ -579,7 +722,10 @@ def _render_chart_per_venue(sym: str, chosen: list[str], hours: int,
             text=f"cycle: {cycle_h}h  ·  σ = {stdev:.2e}  ·  range = {rng:.2e}",
             xref=f"x{i if i > 1 else ''} domain",
             yref=f"y{i if i > 1 else ''} domain",
-            x=0.99, y=0.97, xanchor="right", yanchor="top",
+            x=0.99,
+            y=0.97,
+            xanchor="right",
+            yanchor="top",
             showarrow=False,
             font=dict(size=10, color="gray"),
         )
@@ -587,8 +733,9 @@ def _render_chart_per_venue(sym: str, chosen: list[str], hours: int,
         fig.update_yaxes(title_text="Rate", row=i, col=1, automargin=True)
 
     # Range selector / zoom on top panel (synced to all via shared_xaxes).
-    fig.update_xaxes(rangeselector=_RANGE_BUTTONS,
-                     rangeslider=dict(visible=False), row=1, col=1)
+    fig.update_xaxes(
+        rangeselector=_RANGE_BUTTONS, rangeslider=dict(visible=False), row=1, col=1
+    )
     fig.update_layout(
         height=max(180 * len(visible), 320),
         hovermode="x unified",
@@ -600,8 +747,9 @@ def _render_chart_per_venue(sym: str, chosen: list[str], hours: int,
 def render_history(snapshot: pd.DataFrame):
     symbols = sorted(snapshot["symbol_canonical"].unique())
     default_sym = "BTC/USDT:USDT" if "BTC/USDT:USDT" in symbols else symbols[0]
-    sym = st.selectbox("Symbol", symbols, index=symbols.index(default_sym),
-                       key="hist_symbol")
+    sym = st.selectbox(
+        "Symbol", symbols, index=symbols.index(default_sym), key="hist_symbol"
+    )
     venues_avail = sorted(
         snapshot.loc[snapshot["symbol_canonical"] == sym, "exchange"].unique()
     )
@@ -617,7 +765,9 @@ def render_history(snapshot: pd.DataFrame):
         "for the new upcoming cycle."
     )
     chosen1, hours1 = _venue_timeframe_row(
-        "chart_apy", venues_avail, default_venues=venues_avail,
+        "chart_apy",
+        venues_avail,
+        default_venues=venues_avail,
     )
     _render_chart_apy(sym, chosen1, hours1, venues_avail)
 
@@ -633,7 +783,8 @@ def render_history(snapshot: pd.DataFrame):
         "per-venue volatility within the visible window."
     )
     chosen2, hours2 = _venue_timeframe_row(
-        "chart_raw", venues_avail,
+        "chart_raw",
+        venues_avail,
         default_venues=venues_avail[:4] if len(venues_avail) > 4 else venues_avail,
     )
     _render_chart_per_venue(sym, chosen2, hours2, venues_avail)
@@ -643,14 +794,18 @@ def render_history(snapshot: pd.DataFrame):
 # main
 # --------------------------------------------------------------------------
 
+
 def main():
-    st.set_page_config(page_title="Arb Scanalytics", layout="wide",
-                       initial_sidebar_state="collapsed")
+    st.set_page_config(
+        page_title="Arb Scanalytics", layout="wide", initial_sidebar_state="collapsed"
+    )
     st.title("Arb Scanalytics — Live Radar")
 
     snapshot = _latest_snapshot()
     if snapshot.empty:
-        st.warning("No data yet. Run `python collector.py` (or `--once` for one cycle).")
+        st.warning(
+            "No data yet. Run `python collector.py` (or `--once` for one cycle)."
+        )
         return
 
     render_header()

@@ -24,19 +24,19 @@ MARKETS_RELOAD_INTERVAL_S = 900
 # Locked at the collector boundary; downstream layers only see the slug.
 # Class-id quirks documented in FIELD_NOTES.md ("Venue -> CCXT mapping").
 VENUES = {
-    "BINANCE":  "binance",
-    "BINGX":    "bingx",
-    "BITGET":   "bitget",
-    "BITMART":  "bitmart",
-    "BYBIT":    "bybit",
-    "COINEX":   "coinex",
-    "GATE.IO":  "gate",            # not "gateio"
-    "HTX":      "htx",             # not "huobi"
-    "KUCOIN":   "kucoinfutures",   # separate class; no defaultType
-    "MEXC":     "mexc",
-    "OKX":      "okx",
-    "PHEMEX":   "phemex",
-    "XT.COM":   "xt",
+    "BINANCE": "binance",
+    "BINGX": "bingx",
+    "BITGET": "bitget",
+    "BITMART": "bitmart",
+    "BYBIT": "bybit",
+    "COINEX": "coinex",
+    "GATE.IO": "gate",  # not "gateio"
+    "HTX": "htx",  # not "huobi"
+    "KUCOIN": "kucoinfutures",  # separate class; no defaultType
+    "MEXC": "mexc",
+    "OKX": "okx",
+    "PHEMEX": "phemex",
+    "XT.COM": "xt",
 }
 
 
@@ -56,8 +56,9 @@ async def open_client(canonical: str):
     DNS servers'; the threaded resolver delegates to the OS, which honors
     the VPN's pushed DNS reliably."""
     klass = getattr(ccxt, VENUES[canonical])
-    connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver(),
-                                     ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(
+        resolver=aiohttp.ThreadedResolver(), ttl_dns_cache=300
+    )
     session = aiohttp.ClientSession(connector=connector, trust_env=True)
     opts = {**_ccxt_options(canonical), "session": session}
     client = klass(opts)

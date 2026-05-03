@@ -47,10 +47,9 @@ log = logging.getLogger("compact")
 def compact_day(year: int, month: int, day: int, dry_run: bool = False) -> dict:
     """Compact one day's per-cycle files into per-venue daily files.
     Returns {venue: {status, rows?, sources, size_kb?}}."""
-    partition = (FUNDING_DIR
-                 / f"year={year:04d}"
-                 / f"month={month:02d}"
-                 / f"day={day:02d}")
+    partition = (
+        FUNDING_DIR / f"year={year:04d}" / f"month={month:02d}" / f"day={day:02d}"
+    )
     if not partition.exists():
         log.info("partition %s does not exist; nothing to do", partition)
         return {}
@@ -81,14 +80,20 @@ def compact_day(year: int, month: int, day: int, dry_run: bool = False) -> dict:
             log.warning(
                 "[%s] %s exists but %d source files remain; "
                 "skipping (manual cleanup needed)",
-                venue, target.name, len(sources),
+                venue,
+                target.name,
+                len(sources),
             )
             stats[venue] = {"status": "conflict", "sources": len(sources)}
             continue
 
         if dry_run:
-            log.info("[%s] DRY RUN: would compact %d files into %s",
-                     venue, len(sources), target.name)
+            log.info(
+                "[%s] DRY RUN: would compact %d files into %s",
+                venue,
+                len(sources),
+                target.name,
+            )
             stats[venue] = {"status": "dry-run", "sources": len(sources)}
             continue
 
@@ -105,9 +110,13 @@ def compact_day(year: int, month: int, day: int, dry_run: bool = False) -> dict:
 
             check_rows = pq.read_metadata(temp).num_rows
             if check_rows != n_rows:
-                log.error("[%s] row-count mismatch: wrote %d, read back %d. "
-                          "aborting; sources preserved.",
-                          venue, n_rows, check_rows)
+                log.error(
+                    "[%s] row-count mismatch: wrote %d, read back %d. "
+                    "aborting; sources preserved.",
+                    venue,
+                    n_rows,
+                    check_rows,
+                )
                 temp.unlink(missing_ok=True)
                 stats[venue] = {"status": "error", "sources": len(sources)}
                 continue
@@ -119,10 +128,20 @@ def compact_day(year: int, month: int, day: int, dry_run: bool = False) -> dict:
                 s.unlink()
 
             size_kb = target.stat().st_size / 1024
-            log.info("[%s] %d rows from %d files -> %s (%.1f KB)",
-                     venue, n_rows, len(sources), target.name, size_kb)
-            stats[venue] = {"status": "ok", "rows": n_rows,
-                            "sources": len(sources), "size_kb": size_kb}
+            log.info(
+                "[%s] %d rows from %d files -> %s (%.1f KB)",
+                venue,
+                n_rows,
+                len(sources),
+                target.name,
+                size_kb,
+            )
+            stats[venue] = {
+                "status": "ok",
+                "rows": n_rows,
+                "sources": len(sources),
+                "size_kb": size_kb,
+            }
         except Exception:
             log.exception("[%s] compaction failed; sources preserved", venue)
             temp.unlink(missing_ok=True)
@@ -133,10 +152,16 @@ def compact_day(year: int, month: int, day: int, dry_run: bool = False) -> dict:
 
 def main():
     p = argparse.ArgumentParser(description="Daily parquet compaction")
-    p.add_argument("--day", default=None,
-                   help="UTC day to compact (YYYY-MM-DD). Default: yesterday.")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Show what would happen; don't write/delete.")
+    p.add_argument(
+        "--day",
+        default=None,
+        help="UTC day to compact (YYYY-MM-DD). Default: yesterday.",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would happen; don't write/delete.",
+    )
     args = p.parse_args()
 
     logging.basicConfig(
@@ -150,18 +175,23 @@ def main():
     else:
         target = (datetime.now(timezone.utc) - timedelta(days=1)).date()
 
-    log.info("compacting %s%s", target.isoformat(),
-             " (DRY RUN)" if args.dry_run else "")
-    stats = compact_day(target.year, target.month, target.day,
-                        dry_run=args.dry_run)
+    log.info(
+        "compacting %s%s", target.isoformat(), " (DRY RUN)" if args.dry_run else ""
+    )
+    stats = compact_day(target.year, target.month, target.day, dry_run=args.dry_run)
 
     if not stats:
         return
     total_sources = sum(s.get("sources", 0) for s in stats.values())
     total_rows = sum(s.get("rows", 0) for s in stats.values())
     failed = sum(1 for s in stats.values() if s.get("status") == "error")
-    log.info("=== %d venues, %d files -> %d rows; failures: %d ===",
-             len(stats), total_sources, total_rows, failed)
+    log.info(
+        "=== %d venues, %d files -> %d rows; failures: %d ===",
+        len(stats),
+        total_sources,
+        total_rows,
+        failed,
+    )
     if failed:
         sys.exit(1)
 

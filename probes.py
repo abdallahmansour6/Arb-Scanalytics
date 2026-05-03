@@ -20,12 +20,15 @@ from pprint import pformat
 
 from config import VENUES, open_client
 
-
 # Field-notes: candidate keys that hold the predicted/forecast next-epoch
 # rate inside the raw `info` blob when CCXT's unified parser drops it.
 PREDICTED_KEYS = (
-    "nextFundingRate", "next_funding_rate", "expected_funding_rate",
-    "predicted_funding_rate", "predFundingRateRr", "predFundingRate",
+    "nextFundingRate",
+    "next_funding_rate",
+    "expected_funding_rate",
+    "predicted_funding_rate",
+    "predFundingRateRr",
+    "predFundingRate",
     "estFundingRate",
 )
 
@@ -59,11 +62,17 @@ def _is_usdt_linear(market: dict) -> bool:
 # capabilities
 # ---------------------------------------------------------------------------
 
+
 async def _caps_one(canonical: str) -> dict:
     async with open_client(canonical) as c:
-        keys = ("fetchFundingRate", "fetchFundingRates",
-                "fetchOpenInterest", "fetchOpenInterests",
-                "fetchTicker", "fetchTickers")
+        keys = (
+            "fetchFundingRate",
+            "fetchFundingRates",
+            "fetchOpenInterest",
+            "fetchOpenInterests",
+            "fetchTicker",
+            "fetchTickers",
+        )
         return {k: c.has.get(k) for k in keys}
 
 
@@ -71,56 +80,69 @@ async def capabilities():
     print("\n" + "=" * 110)
     print("CAPABILITIES (c.has)")
     print("=" * 110)
-    results = await asyncio.gather(*(_caps_one(v) for v in VENUES),
-                                   return_exceptions=True)
-    print(f"{'venue':<10}{'fetchFundingRate':>18}{'fetchFundingRates':>20}"
-          f"{'fetchOpenInterest':>20}{'fetchOpenInterests':>20}"
-          f"{'fetchTicker':>14}{'fetchTickers':>14}")
+    results = await asyncio.gather(
+        *(_caps_one(v) for v in VENUES), return_exceptions=True
+    )
+    print(
+        f"{'venue':<10}{'fetchFundingRate':>18}{'fetchFundingRates':>20}"
+        f"{'fetchOpenInterest':>20}{'fetchOpenInterests':>20}"
+        f"{'fetchTicker':>14}{'fetchTickers':>14}"
+    )
     print("-" * 110)
     for canonical, r in zip(VENUES, results):
         if isinstance(r, Exception):
             print(f"{canonical:<10}  ERROR: {type(r).__name__}: {r}")
             continue
-        print(f"{canonical:<10}"
-              f"{str(r['fetchFundingRate']):>18}"
-              f"{str(r['fetchFundingRates']):>20}"
-              f"{str(r['fetchOpenInterest']):>20}"
-              f"{str(r['fetchOpenInterests']):>20}"
-              f"{str(r['fetchTicker']):>14}"
-              f"{str(r['fetchTickers']):>14}")
+        print(
+            f"{canonical:<10}"
+            f"{str(r['fetchFundingRate']):>18}"
+            f"{str(r['fetchFundingRates']):>20}"
+            f"{str(r['fetchOpenInterest']):>20}"
+            f"{str(r['fetchOpenInterests']):>20}"
+            f"{str(r['fetchTicker']):>14}"
+            f"{str(r['fetchTickers']):>14}"
+        )
 
 
 # ---------------------------------------------------------------------------
 # markets
 # ---------------------------------------------------------------------------
 
+
 async def _markets_one(canonical: str) -> dict:
     async with open_client(canonical) as c:
         await c.load_markets()
         usdt_linear = [s for s, m in c.markets.items() if _is_usdt_linear(m)]
-        return {"total_markets": len(c.markets), "usdt_linear": len(usdt_linear),
-                "sample": usdt_linear[:5]}
+        return {
+            "total_markets": len(c.markets),
+            "usdt_linear": len(usdt_linear),
+            "sample": usdt_linear[:5],
+        }
 
 
 async def markets():
     print("\n" + "=" * 110)
     print("MARKETS (USDT-linear perp count per venue)")
     print("=" * 110)
-    results = await asyncio.gather(*(_markets_one(v) for v in VENUES),
-                                   return_exceptions=True)
+    results = await asyncio.gather(
+        *(_markets_one(v) for v in VENUES), return_exceptions=True
+    )
     print(f"{'venue':<10}{'total':>10}{'usdt_linear':>14}  sample")
     print("-" * 110)
     for canonical, r in zip(VENUES, results):
         if isinstance(r, Exception):
             print(f"{canonical:<10}  ERROR: {type(r).__name__}: {r}")
             continue
-        print(f"{canonical:<10}{r['total_markets']:>10}{r['usdt_linear']:>14}"
-              f"  {r['sample']}")
+        print(
+            f"{canonical:<10}{r['total_markets']:>10}{r['usdt_linear']:>14}"
+            f"  {r['sample']}"
+        )
 
 
 # ---------------------------------------------------------------------------
 # ticker
 # ---------------------------------------------------------------------------
+
 
 async def _ticker_one(canonical: str, symbol: str) -> dict:
     async with open_client(canonical) as c:
@@ -152,8 +174,9 @@ async def ticker(symbol: str = "BTC/USDT:USDT"):
     print("\n" + "=" * 110)
     print(f"TICKER (fetch_ticker, symbol={symbol})")
     print("=" * 110)
-    results = await asyncio.gather(*(_ticker_one(v, symbol) for v in VENUES),
-                                   return_exceptions=True)
+    results = await asyncio.gather(
+        *(_ticker_one(v, symbol) for v in VENUES), return_exceptions=True
+    )
     for canonical, r in zip(VENUES, results):
         print(f"\n--- {canonical} ---")
         if isinstance(r, Exception):
@@ -165,6 +188,7 @@ async def ticker(symbol: str = "BTC/USDT:USDT"):
 # ---------------------------------------------------------------------------
 # funding
 # ---------------------------------------------------------------------------
+
 
 def _interval_h(unified: dict) -> tuple[float | None, str]:
     """Return (interval_hours, source). Mirrors collector logic so we can
@@ -215,8 +239,9 @@ async def funding(symbol: str = "BTC/USDT:USDT"):
     print("\n" + "=" * 110)
     print(f"FUNDING (fetch_funding_rate, symbol={symbol})")
     print("=" * 110)
-    results = await asyncio.gather(*(_funding_one(v, symbol) for v in VENUES),
-                                   return_exceptions=True)
+    results = await asyncio.gather(
+        *(_funding_one(v, symbol) for v in VENUES), return_exceptions=True
+    )
     for canonical, r in zip(VENUES, results):
         print(f"\n--- {canonical} ---")
         if isinstance(r, Exception):
@@ -228,6 +253,7 @@ async def funding(symbol: str = "BTC/USDT:USDT"):
 # ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
+
 
 async def main():
     cmd = (sys.argv[1] if len(sys.argv) > 1 else "all").lower()

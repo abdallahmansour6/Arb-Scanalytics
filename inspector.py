@@ -21,7 +21,6 @@ import duckdb
 
 from config import FUNDING_DIR
 
-
 _GLOB = str(FUNDING_DIR / "**" / "*.parquet").replace("\\", "/")
 
 
@@ -84,7 +83,9 @@ def btc():
 
 def spreads(limit: int = 20):
     db = _open()
-    print(f"\n=== top {limit} cross-venue funding spreads (latest, both legs >= $1M vol) ===")
+    print(
+        f"\n=== top {limit} cross-venue funding spreads (latest, both legs >= $1M vol) ==="
+    )
     # Per-leg + cross-multiplier refactor: short_* / long_* values come
     # from the exact two (venue, canonical) rows with the highest /
     # lowest APY for each base_coin. Grouping by base_coin (instead of
@@ -168,7 +169,10 @@ MODES = {"overview": overview, "btc": btc, "spreads": spreads, "anomalies": anom
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
     if cmd == "all":
-        overview(); btc(); spreads(); anomalies()
+        overview()
+        btc()
+        spreads()
+        anomalies()
         return
     fn = MODES.get(cmd)
     if not fn:
