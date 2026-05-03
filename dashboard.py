@@ -56,11 +56,12 @@ log = logging.getLogger("dashboard")
 #   hourly:     <VENUE>_hourly_<YYYYMMDDHH>.parquet (compact.py --mode hourly)
 #   daily:      <VENUE>_daily.parquet              (compact.py --mode daily)
 #
-# Only the per-cycle pattern is sortable-by-ms — the dashboard groups those
-# by venue to pick the K most recent or files within a window. Hourly and
-# daily files fall through to a "deeper fallback, always include" bucket;
-# they're few enough and cheap enough that we read them on every query.
+# Per-cycle is sortable-by-ms (last digit-group is the cycle's ms timestamp).
+# Hourly is sortable-by-bucket (last digit-group is YYYYMMDDHH and orders
+# correctly as a string or as int). Daily is per-venue, no temporal sort
+# needed — it's the deepest fallback.
 _CYCLE_FILE_RE = re.compile(r"([A-Z\.]+)_(\d{13})\.parquet$")
+_HOURLY_FILE_RE = re.compile(r"([A-Z\.]+)_hourly_(\d{10})\.parquet$")
 
 
 # --------------------------------------------------------------------------
@@ -94,26 +95,25 @@ _CYCLE_FILE_RE = re.compile(r"([A-Z\.]+)_(\d{13})\.parquet$")
 # — the second attempt sees the post-compaction file set.
 
 
-def _latest_files(k: int = 20) -> list[str]:
-    """Return the parquet files needed to build a 'latest snapshot per
-    (exchange, symbol)' view, pruning the un-compacted per-cycle tail in
-    today's partition.
+def _classify_files() -> tuple[
+    dict[str, list[tuple[int, str]]],
+    dict[str, list[tuple[int, str]]],
+    list[str],
+]:
+    """Walk FUNDING_DIR once and bucket every `*.parquet` by lifecycle.
+    Returns (per_venue_cycle, per_venue_hourly, daily_or_unknown), where
+    each per-venue list is `[(ms_anchor, path), ...]`:
+      * cycle: ms_anchor is the cycle's filename ms timestamp.
+      * hourly: ms_anchor is the bucket's start-of-hour ms (parsed from
+        the YYYYMMDDHH suffix), so consumers can compare it to a window
+        cutoff in the same units as cycle.
 
-    For each venue we keep the K most recent per-cycle files (sorted by the
-    ms timestamp embedded in the filename) plus all hourly + daily
-    compacted files. 13 venues × K + a small constant of compacted files
-    is a few hundred paths total — every row that `qualify rn=1 over
-    (exchange, symbol)` could possibly select stays present, with the
-    compacted files acting as the deeper fallback for any pair that's
-    been intermittently dropped from a venue's batch responses for
-    longer than K cycles.
-
-    K=20 covers ~10 minutes of cycle history at 30 s cadence; raise it if
-    you ever observe pairs disappearing from the snapshot after a venue's
-    transient drop.
-    """
-    by_venue: dict[str, list[tuple[int, str]]] = defaultdict(list)
-    compacted: list[str] = []
+    The Python-side enumeration is the only directory walk in the
+    dashboard's hot path (~150 ms for ~10 k files); both `_latest_files()`
+    and `_history_files()` consume this single classification."""
+    cycle: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    hourly: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    daily: list[str] = []
     for path in FUNDING_DIR.glob("**/*.parquet"):
         # Forward slashes for cross-platform DuckDB compatibility — Path
         # stringifies with backslashes on Windows, which we don't want
@@ -121,48 +121,83 @@ def _latest_files(k: int = 20) -> list[str]:
         spath = str(path).replace("\\", "/")
         m = _CYCLE_FILE_RE.search(path.name)
         if m:
-            by_venue[m.group(1)].append((int(m.group(2)), spath))
-        else:
-            compacted.append(spath)
+            cycle[m.group(1)].append((int(m.group(2)), spath))
+            continue
+        m = _HOURLY_FILE_RE.search(path.name)
+        if m:
+            s = m.group(2)  # "YYYYMMDDHH"
+            bucket_ms = int(datetime(
+                int(s[:4]), int(s[4:6]), int(s[6:8]), int(s[8:10]),
+                tzinfo=timezone.utc,
+            ).timestamp() * 1000)
+            hourly[m.group(1)].append((bucket_ms, spath))
+            continue
+        daily.append(spath)
+    return cycle, hourly, daily
 
-    selected = list(compacted)
-    for items in by_venue.values():
+
+def _latest_files(k_cycle: int = 20, k_hourly: int = 3) -> list[str]:
+    """Files needed to build a 'latest snapshot per (exchange, symbol)' view.
+
+    For each venue: the `k_cycle` most recent per-cycle files (covers the
+    last ~10 min at K=20, 30 s cadence) plus the `k_hourly` most recent
+    hourly compacted files (a few hours of fallback) plus all daily files.
+    A pair that's been intermittently dropped from a venue's batch
+    responses for up to a few hours still surfaces in the snapshot via
+    `qualify rn=1`'s pick of the most recent row across these files.
+
+    Bounded file count: 13 venues × (k_cycle + k_hourly) + ~13 daily ≈
+    a few hundred paths at most. Reading all 24 of today's hourly files
+    would inflate that by 312 with no benefit for snapshot semantics —
+    the 'fallback for an intermittently-dropped pair' use-case only
+    needs *recent* hourly buckets."""
+    cycle, hourly, daily = _classify_files()
+    selected = list(daily)
+    for items in hourly.values():
         items.sort(reverse=True)
-        selected.extend(p for _, p in items[:k])
+        selected.extend(p for _, p in items[:k_hourly])
+    for items in cycle.values():
+        items.sort(reverse=True)
+        selected.extend(p for _, p in items[:k_cycle])
     return selected
 
 
 def _history_files(hours: int) -> list[str]:
-    """Return the parquet files needed to cover the last `hours` of history.
+    """Files needed to cover the last `hours` of history for any symbol.
 
-    Includes every per-cycle file whose filename ms timestamp is within
-    the window (cutoff = max-filename-ms − hours_ms) plus every hourly +
-    daily compacted file. The filename ms approximates the cycle's ts_utc
-    to within a fraction of a second; the SQL still applies the exact
-    ts_utc filter on top, so any rounding only changes the file set, not
-    the result.
+    Per-cycle files within the window (cutoff = max-filename-ms − hours_ms)
+    plus hourly compacted buckets that *intersect* the window plus all
+    daily files. Hourly files are typed as `bucket-start ms` so a bucket
+    intersects the window iff `bucket_start + 3600_000 > cutoff`. The SQL
+    still applies the exact ts_utc filter on top, so any imprecision in
+    the file-set bounds only changes which files we read, not the result.
 
     With hourly compaction running, today's partition holds at most ~1 h
-    of un-compacted per-cycle files (~1.5 k) plus 23 hourly compacted
-    files; a 24 h history query reads ~150 files total. Without it we'd
-    be back to scanning all of today's per-cycle footers (~27 k).
-    """
+    of un-compacted per-cycle files plus the bucket files for completed
+    hours; for a 24 h window we read ~1 h of cycles + 24 hourly + ~13
+    daily ≈ a few hundred files. Without compaction we'd be scanning
+    all of today's per-cycle footers (~27 k)."""
     hours_ms = int(hours) * 3600 * 1000
-    cycle: list[tuple[int, str]] = []
-    compacted: list[str] = []
-    for path in FUNDING_DIR.glob("**/*.parquet"):
-        spath = str(path).replace("\\", "/")
-        m = _CYCLE_FILE_RE.search(path.name)
-        if m:
-            cycle.append((int(m.group(2)), spath))
-        else:
-            compacted.append(spath)
+    cycle_by_venue, hourly_by_venue, daily = _classify_files()
 
-    if not cycle:
-        return compacted
-    cutoff_ms = max(t for t, _ in cycle) - hours_ms
-    selected = [p for t, p in cycle if t >= cutoff_ms]
-    selected.extend(compacted)
+    cycle_flat = [it for items in cycle_by_venue.values() for it in items]
+    hourly_flat = [it for items in hourly_by_venue.values() for it in items]
+
+    if not cycle_flat and not hourly_flat:
+        return list(daily)
+
+    # Window anchor = freshest available ts. Prefer a cycle file when
+    # present (per-cycle ms is always >= the latest hourly bucket start).
+    anchor_ms = (
+        max(t for t, _ in cycle_flat) if cycle_flat
+        else max(t for t, _ in hourly_flat)
+    )
+    cutoff_ms = anchor_ms - hours_ms
+
+    selected = [p for t, p in cycle_flat if t >= cutoff_ms]
+    # An hourly bucket [t, t+1h) intersects [cutoff, ∞) iff t+1h > cutoff.
+    selected.extend(p for t, p in hourly_flat if t + 3_600_000 > cutoff_ms)
+    selected.extend(daily)
     return selected
 
 
