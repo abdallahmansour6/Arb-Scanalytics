@@ -47,13 +47,11 @@ from config import FUNDING_DIR
 logging.getLogger("tornado.general").setLevel(logging.ERROR)
 
 
-_GLOB = str(FUNDING_DIR / "**" / "*.parquet").replace("\\", "/")
-
 # Per-cycle parquet files are named `<VENUE>_<ms_ts>.parquet`; compacted
 # prior-day files use a `_daily` suffix instead. The regex matches only the
 # per-cycle form so we can sort by the embedded ms timestamp; daily files
-# fall through to a separate bucket and always participate in the snapshot
-# read as a deeper fallback.
+# fall through to a separate bucket and always participate as the deeper
+# fallback in any read.
 _CYCLE_FILE_RE = re.compile(r"([A-Z\.]+)_(\d+)\.parquet$")
 
 
@@ -61,26 +59,24 @@ _CYCLE_FILE_RE = re.compile(r"([A-Z\.]+)_(\d+)\.parquet$")
 # data access
 # --------------------------------------------------------------------------
 #
-# Two read paths over the same Parquet store, deliberately decoupled:
+# Both queries (`_latest_snapshot()` and `_history()`) avoid the wide-glob
+# DuckDB view pattern. Reasons learned the hard way:
+#   * Today's un-compacted partition holds 26 k+ per-cycle files; DuckDB
+#     walks every parquet footer just to register a view over
+#     `**/*.parquet`, which dominates cache-miss latency (~22 s for
+#     `select max(ts_utc)` alone) and can exhaust the default 1024 FD
+#     limit on full-fan-out aggregates.
+#   * A connection cached via `@st.cache_resource` can be left in a bad
+#     state if a Streamlit rerun interrupts a query mid-flight, poisoning
+#     every subsequent caller.
 #
-# - `_db()` exposes a wide-glob view (`f`) used by user-driven queries
-#   (`_history()`). Cache-miss latency on this path is dominated by
-#   DuckDB walking every parquet footer in today's un-compacted partition
-#   (~26 k files), which can also exhaust the default 1024 FD limit on
-#   full-fan-out aggregates. Acceptable for a one-shot history fetch
-#   that the user explicitly triggered.
-#
-# - `_latest_snapshot()` is the hot path — every 10 s auto-refresh in
-#   the header / anomalies / spreads fragments calls into it. It reads
-#   only a narrow file list (`_latest_files()`) on a *fresh* DuckDB
-#   connection, bypassing `_db()` entirely. Two reasons:
-#     * The wide glob's metadata scan dominates; pruning to the K most
-#       recent cycle files per venue collapses 26 k+ files to a few
-#       hundred without changing query semantics (verified empirically).
-#     * Streamlit reruns can interrupt a query mid-flight; the shared
-#       `_db()` connection could be left in a bad state by such an
-#       interrupt. A fresh connection per call isolates that blast
-#       radius to a single snapshot fetch.
+# Instead, each query enumerates exactly the files it needs in Python
+# (cheap: ~150 ms for a 26 k-file directory walk) and reads them on a
+# fresh DuckDB connection that lives only for the duration of the query.
+# `_latest_files()` keeps the K most recent per-cycle files per venue;
+# `_history_files()` keeps per-cycle files within the time window. Both
+# always include all `*_daily.parquet` compacted files as the deeper
+# fallback for older history.
 
 
 def _latest_files(k: int = 20) -> list[str]:
@@ -120,26 +116,45 @@ def _latest_files(k: int = 20) -> list[str]:
     return selected
 
 
-@st.cache_resource
-def _db():
-    """Shared DuckDB connection over the wide parquet glob. Used by
-    user-driven queries (`_history()`); not on the auto-refresh hot path."""
-    db = duckdb.connect()
-    db.sql(f"""create or replace view f as
-               select * from read_parquet('{_GLOB}',
-                                          hive_partitioning=true,
-                                          union_by_name=true)""")
-    return db
+def _history_files(hours: int) -> list[str]:
+    """Return the parquet files needed to cover the last `hours` of history.
+
+    Includes every per-cycle file whose filename ms timestamp is within
+    the window (cutoff = max-filename-ms − hours_ms) plus every
+    `*_daily.parquet` compacted file. The filename ms approximates the
+    cycle's ts_utc to within a fraction of a second; the SQL still
+    applies the exact ts_utc filter on top, so any rounding only changes
+    the file set, not the result.
+
+    For typical 1–6 h windows this collapses 26 k+ files to a 1.5 k–10 k
+    range. Once today's partition has been compacted (each 00:30 UTC),
+    a 24 h+ window degrades to ~13 daily files plus today's un-compacted
+    cycles — i.e., near-optimal.
+    """
+    hours_ms = int(hours) * 3600 * 1000
+    cycle: list[tuple[int, str]] = []
+    daily: list[str] = []
+    for path in FUNDING_DIR.glob("**/*.parquet"):
+        spath = str(path).replace("\\", "/")
+        m = _CYCLE_FILE_RE.search(path.name)
+        if m:
+            cycle.append((int(m.group(2)), spath))
+        else:
+            daily.append(spath)
+
+    if not cycle:
+        return daily
+    cutoff_ms = max(t for t, _ in cycle) - hours_ms
+    selected = [p for t, p in cycle if t >= cutoff_ms]
+    selected.extend(daily)
+    return selected
 
 
 @st.cache_data(ttl=10)
 def _latest_snapshot() -> pd.DataFrame:
     """One row per (exchange, symbol_canonical) — most recent observation,
     with global oi_rank descending by open_interest_usd. Null OI sorts to
-    the bottom of the rank order.
-
-    Hot path. Reads a narrow file list on a fresh DuckDB connection — see
-    the data-access docstring at the top of this section for the rationale."""
+    the bottom of the rank order."""
     files = _latest_files()
     if not files:
         return pd.DataFrame()
@@ -167,27 +182,37 @@ def _latest_snapshot() -> pd.DataFrame:
 
 @st.cache_data(ttl=10)
 def _history(symbol: str, hours: int) -> pd.DataFrame:
+    """Time-windowed history for a single symbol across all venues."""
+    files = _history_files(hours)
+    if not files:
+        return pd.DataFrame()
     # Compute the offset in Python: hours * 3600 * 1000 overflows DuckDB's
     # INT32 inference at hours >= ~596 (720 was the trigger seen in the
     # wild). Python ints are arbitrary precision, and passing the result
     # as a bound parameter has DuckDB infer INT64.
     offset_ms = int(hours) * 3600 * 1000
-    return (
-        _db()
-        .execute(
-            """
-        select ts_utc, exchange, funding_rate, funding_interval_h,
-               next_funding_ts, predicted_rate,
-               apy_norm * 100 as apy_pct, mark_price, volume_24h_usd
-        from f
-        where symbol_canonical = ?
-          and ts_utc >= (select max(ts_utc) from f) - ?
-        order by ts_utc
-    """,
-            [symbol, offset_ms],
+    db = duckdb.connect()
+    try:
+        # Register the narrow file set as a temp view so the WHERE clause's
+        # `(select max(ts_utc) from f)` subquery has something to reference.
+        db.sql(
+            f"create temp view f as "
+            f"select * from read_parquet({files!r}, union_by_name=true)"
         )
-        .fetchdf()
-    )
+        return db.execute(
+            """
+            select ts_utc, exchange, funding_rate, funding_interval_h,
+                   next_funding_ts, predicted_rate,
+                   apy_norm * 100 as apy_pct, mark_price, volume_24h_usd
+            from f
+            where symbol_canonical = ?
+              and ts_utc >= (select max(ts_utc) from f) - ?
+            order by ts_utc
+        """,
+            [symbol, offset_ms],
+        ).fetchdf()
+    finally:
+        db.close()
 
 
 # --------------------------------------------------------------------------
