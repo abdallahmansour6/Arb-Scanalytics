@@ -556,9 +556,19 @@ def render_header():
 
 @st.fragment(run_every=30)
 def render_anomalies():
+    # Filter widgets live INSIDE the fragment on purpose: a widget change
+    # inside a fragment triggers a *partial* rerun of just this fragment,
+    # so editing a filter dims this one table once and leaves the header /
+    # other tab untouched. (If they sat outside, every edit would cascade
+    # into a full main() rerun and re-execute every fragment on the page.)
     snapshot = _latest_snapshot()
     if snapshot.empty:
         return
+
+    st.markdown("##### Filters")
+    _filter_inputs("anom", snapshot)
+    st.markdown("##### Top anomalies by |APY|")
+
     snapshot = _add_countdown(snapshot, _now_ms())
 
     f = {
@@ -606,9 +616,16 @@ def render_anomalies():
 
 @st.fragment(run_every=30)
 def render_spreads():
+    # See render_anomalies for the rationale behind keeping filters inside
+    # the fragment.
     snapshot = _latest_snapshot()
     if snapshot.empty:
         return
+
+    st.markdown("##### Filters")
+    _filter_inputs("spread", snapshot, include_min_venues=True)
+    st.markdown("##### Symbols ranked by cross-venue ΔAPY")
+
     snapshot = _add_countdown(snapshot, _now_ms())
 
     f = {
@@ -1054,16 +1071,13 @@ def main():
         ["Anomalies", "Cross-venue spreads", "Symbol history"]
     )
 
+    # Filters + section headers live inside each fragment now (see
+    # render_anomalies / render_spreads); editing a filter then re-runs
+    # only that fragment instead of cascading into a full main() rerun.
     with tab_anom:
-        st.markdown("##### Filters")
-        _filter_inputs("anom", snapshot)
-        st.markdown("##### Top anomalies by |APY|")
         render_anomalies()
 
     with tab_spread:
-        st.markdown("##### Filters")
-        _filter_inputs("spread", snapshot, include_min_venues=True)
-        st.markdown("##### Symbols ranked by cross-venue ΔAPY")
         render_spreads()
 
     with tab_hist:
