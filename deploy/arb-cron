@@ -3,9 +3,16 @@
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Daily compaction at 00:30 UTC — combine yesterday's per-cycle parquet
-# files into one file per venue. Keeps disk usage flat across the year.
-30 0 * * * root cd /opt/Arb-Scanalytics && /opt/Arb-Scanalytics/.venv/bin/python compact.py >> /var/log/arb-compact.log 2>&1
+# Hourly compaction at minute 5 of every hour. Compacts every (day, hour)
+# bucket older than 1 hour that still has un-compacted per-cycle files.
+# Bounds the un-compacted file count on today's partition to ~1 hour's
+# worth (~1.5 k files) so dashboard reads stay sub-second.
+5 * * * * root cd /opt/Arb-Scanalytics && /opt/Arb-Scanalytics/.venv/bin/python compact.py --mode hourly >> /var/log/arb-compact.log 2>&1
+
+# Daily compaction at 00:30 UTC. Consolidates yesterday's hourly + any
+# leftover per-cycle files into one daily file per venue. Catch-all for
+# hours the hourly compactor missed.
+30 0 * * * root cd /opt/Arb-Scanalytics && /opt/Arb-Scanalytics/.venv/bin/python compact.py --mode daily >> /var/log/arb-compact.log 2>&1
 
 # Liveness check every 5 minutes. Pings Pushover if no parquet has been
 # written in the last 5 minutes (cooldown 60 min between pings).

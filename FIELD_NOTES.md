@@ -294,13 +294,14 @@ Production lives on the Singapore DigitalOcean droplet (2 vCPU /
 4 GB / 50 GB) at `/opt/Arb-Scanalytics/`. Two systemd services and
 two cron jobs comprise the runtime.
 
-| Component               | Path / unit                                       | Role                                                                  |
-|-------------------------|---------------------------------------------------|-----------------------------------------------------------------------|
-| `arb-collector.service` | `/etc/systemd/system/arb-collector.service`       | Long-running async collector, 13 venues, 30 s cadence, writes parquet |
-| `arb-dashboard.service` | `/etc/systemd/system/arb-dashboard.service`       | Streamlit on `0.0.0.0:8501`                                           |
-| Daily compaction        | `/opt/Arb-Scanalytics/compact.py` + cron 00:30 UTC| Merges yesterday's per-cycle files into one file per venue            |
-| Liveness ping           | `/opt/Arb-Scanalytics/liveness_ping.sh` + cron */5 | Pushover alert if no parquet write in last 5 min (60 min cooldown)    |
-| Swap                    | `/swapfile` (1 GB), `vm.swappiness=10`            | Memory safety net                                                     |
+| Component               | Path / unit                                        | Role                                                                                              |
+|-------------------------|----------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| `arb-collector.service` | `/etc/systemd/system/arb-collector.service`        | Long-running async collector, 13 venues, 30 s cadence, writes parquet                             |
+| `arb-dashboard.service` | `/etc/systemd/system/arb-dashboard.service`        | Streamlit on `0.0.0.0:8501`. `LimitNOFILE=65536`                                                  |
+| Hourly compaction       | `compact.py --mode hourly` + cron `5 * * * *`      | Compacts complete hour buckets (≥ 1 h old) on today's partition into `<VENUE>_hourly_<YYYYMMDDHH>.parquet` |
+| Daily compaction        | `compact.py --mode daily` + cron `30 0 * * *`      | Sweeps yesterday's hourly + leftover per-cycle files into `<VENUE>_daily.parquet`                 |
+| Liveness ping           | `/opt/Arb-Scanalytics/liveness_ping.sh` + cron */5 | Pushover alert if no parquet write in last 5 min (60 min cooldown)                                |
+| Swap                    | `/swapfile` (1 GB), `vm.swappiness=10`             | Memory safety net                                                                                 |
 
 Services are `enabled` for boot. Pushover credentials live in the
 scanner's own `.env` at `/opt/Arb-Scanalytics/.env` (gitignored,
@@ -363,31 +364,53 @@ A clean `systemctl stop` does not auto-restart.
 
 ### Disk / data
 
-Compaction runs at 00:30 UTC daily and reduces disk usage ~6× by
-merging per-cycle files into per-venue daily files (named
-`<VENUE>_daily.parquet` inside the day partition). Same rows, same
-columns, same query semantics — pure storage optimization.
+Compaction runs in two stages over a per-cycle file's lifecycle:
+
+```
+per-cycle (collector, 30 s cadence)   <VENUE>_<ms_ts>.parquet
+     ↓ hourly compaction (cron 5 * * * *)
+hourly                                <VENUE>_hourly_<YYYYMMDDHH>.parquet
+     ↓ daily compaction (cron 30 0 * * *)
+daily                                 <VENUE>_daily.parquet
+```
+
+Hourly compaction bounds the un-compacted file count on today's
+partition to roughly one hour's worth (~1.5 k files), keeping
+dashboard reads sub-second. Daily compaction sweeps yesterday's
+hourly + any leftover per-cycle files into one file per venue per
+day. Both are atomic per (venue, target) — `.tmp` write, row-count
+validation, atomic rename, then source deletion. The daily run is
+the catch-all for any hours the hourly run missed.
 
 ```bash
 # Disk usage
 df -h /
 du -sh /opt/Arb-Scanalytics/data
 
-# Dry-run compaction (shows what would happen, doesn't change anything)
+# Dry-run hourly compaction (shows what would happen, doesn't change anything)
 cd /opt/Arb-Scanalytics
-.venv/bin/python compact.py --day 2026-05-01 --dry-run
+.venv/bin/python compact.py --mode hourly --dry-run
 
-# Run compaction manually for a specific day (UTC date)
-.venv/bin/python compact.py --day 2026-05-01
+# Manual hourly catch-up (compacts every hour bucket ≥ 1 h old that still
+# has un-compacted per-cycle files; idempotent)
+.venv/bin/python compact.py --mode hourly
 
-# Look at compaction log history
+# One specific hour
+.venv/bin/python compact.py --mode hour --day 2026-05-01 --hour 14
+
+# Daily compaction for a specific day (per-cycle + hourly → daily)
+.venv/bin/python compact.py --mode daily --day 2026-05-01
+
+# Compaction log history
 tail -200 /var/log/arb-compact.log
 ```
 
-Compaction is **idempotent** — re-running on a day that's already
-compacted is a no-op. **Atomic per venue** — writes a `.tmp` file,
-validates row count, atomic rename, then deletes sources. A crash
-mid-run leaves source files intact for retry.
+Both modes are **idempotent** — re-running on a (day, hour) or day
+that's already compacted is a no-op (sources already deleted).
+**Race-safe with the live collector**: hourly only touches buckets
+≥ 1 h old, so the collector never writes into a candidate bucket.
+**Race with live readers** is absorbed by `dashboard.py`'s one-shot
+retry on `IOException('Cannot open file ...')`.
 
 ### Liveness alerts
 
@@ -439,6 +462,26 @@ intervention needed. Compaction picks up wherever it left off
 
 ---
 
+## VPS ad-hoc probing — gotchas
+
+**SSH banner timeout under memory pressure.** `Connection timed out
+during banner exchange` while ICMP to the box still works = sshd
+can't spawn session children because the 2 vCPU / 4 GB droplet is
+swap-thrashing. Reach in with `ssh -o ConnectTimeout=120 ...`
+(eventually lets through) and check `free -h` plus
+`ps -eo pid,%mem,rss,cmd --sort=-rss | head`.
+
+**Orphan remote python from `ssh "python -c ..."`.** A remote python
+interpreter spawned this way survives the local SSH client being
+killed (Ctrl-C, harness cancel, network drop). The heap stays
+allocated and the script keeps running on the VPS — a single 2 GB+
+pandas/duckdb process can drag the box into swap-thrash within
+minutes. To terminate cleanly: fresh SSH session, then `kill <pid>`
+directly. For ad-hoc work, prefix the remote command with
+`timeout 60` so it self-terminates regardless of client behavior.
+
+---
+
 ## Sync workflow — local laptop → GitHub → VPS
 
 Repo: `github.com/abdallahmansour6/Arb-Scanalytics` (private). `origin`
@@ -458,6 +501,15 @@ cd /opt/Arb-Scanalytics
 git pull origin main
 
 # 3. Depending on WHAT changed, restart accordingly:
+
+# To do a hard reset to a prior commit (e.g., if the latest broke something):
+# On laptop:
+git reset --hard <hash>
+git push --force-with-lease origin main
+# On VPS:
+git fetch origin main
+git reset --hard origin/main
+
 ```
 
 ### What needs a restart after `git pull`
