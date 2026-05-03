@@ -68,12 +68,10 @@
             </diagram_of_proposed_architecture>
         </components>
 
-        <scope_guardrails form="explicit negative space">
+        <scope_guardrails form="explicit negative space for now">
             <no_orderbook_history>Top-of-book snapshots only if needed. Deep L2 persistence is explicitly rejected as a storage and complexity trap.</no_orderbook_history>
             <no_trade_tape>Tick-level trade ingestion out of scope.</no_trade_tape>
-            <no_live_ml>No model serving against the live radar. Statistical modeling lives in the research layer only.</no_live_ml>
             <no_auth_layer>Single-operator, localhost-bound, mirroring the engine's deployment posture.</no_auth_layer>
-            <no_charting_platform_drift>The scanner is not a charting app, not a data platform, not a second product. Any feature pulling it in those directions is rejected.</no_charting_platform_drift>
         </scope_guardrails>
 
         <deployment_posture>Singapore VPS, co-located with the engine but with fully independent lifecycle. Two systemd services — arb-collector (ingestion) and arb-dashboard (Streamlit radar) — plus two cron jobs (daily Parquet compaction, 5-minute liveness watch). The engine never shares runtime state with any of them; engine-side reads of scanner data go strictly through the Parquet substrate. Shares the VPS's geographic latency barycenter across the 13 target venues, though latency is not a first-order concern for the scanner's polling cadence.</deployment_posture>
