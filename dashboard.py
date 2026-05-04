@@ -42,6 +42,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -473,6 +474,141 @@ def render_anomalies():
     )
 
 
+# --------------------------------------------------------------------------
+# Spreads-tab scatter — the 4D entry point above the ranked table
+# --------------------------------------------------------------------------
+#
+# Each axis answers one of the four sub-questions of trade viability:
+#   x  → entry cost           (engine convention: +bps = credit, −bps = cost)
+#   y  → yield edge           (ΔAPY %)
+#   size  → deployable size   (min-of-legs 24h volume; capacity is bottlenecked
+#                              by the worse leg)
+#   color → profit-leg timing (settles_in of whichever leg is paying us the
+#                              most this epoch — the "max-magnitude payer";
+#                              see _profit_leg_settles_in for the rule)
+#
+# Adding a new dimension is a one-liner: derive the column once on `agg`
+# (alongside `min_vol_musd` / `profit_settles_in`), wire it into
+# _SPREAD_SCATTER_DIMS, and append to _SPREAD_HOVER_FIELDS if it should also
+# appear in the tooltip.
+
+# Single source of truth for axis → column mapping. Swap a dimension here
+# without touching the chart code.
+_SPREAD_SCATTER_DIMS = {
+    "x": "entry_basis_bps",
+    "y": "delta_apy_pct",
+    "size": "min_vol_musd",
+    "color": "profit_settles_in",
+}
+
+# Declarative hover content. Each entry is (column, label, fmt) where `fmt`
+# is the d3-format suffix used inside `%{customdata[i]fmt}`. Empty fmt ("")
+# renders the raw value — works for strings like cycles_h.
+_SPREAD_HOVER_FIELDS: list[tuple[str, str, str]] = [
+    ("base_coin",        "Base",            ""),
+    ("delta_apy_pct",    "ΔAPY %",          ":.1f"),
+    ("entry_basis_bps",  "Entry basis bps", ":.1f"),
+    ("cycles_h",         "Cycles h",        ""),
+    ("venue_short",      "Short venue",     ""),
+    ("short_symbol",     "Short symbol",    ""),
+    ("short_apy_pct",    "Short APY %",     ":.1f"),
+    ("short_vol_musd",   "Short vol $M",    ":.1f"),
+    ("short_settles_in", "Short settles m", ":.0f"),
+    ("venue_long",       "Long venue",      ""),
+    ("long_symbol",      "Long symbol",     ""),
+    ("long_apy_pct",     "Long APY %",      ":.1f"),
+    ("long_vol_musd",    "Long vol $M",     ":.1f"),
+    ("long_settles_in",  "Long settles m",  ":.0f"),
+]
+
+
+def _hover_template(fields: list[tuple[str, str, str]]) -> str:
+    """Build a plotly hovertemplate from a list of (col, label, fmt) tuples.
+    Each tuple becomes one `<b>label</b>: %{customdata[i]fmt}` line."""
+    lines = [
+        f"<b>{label}</b>: %{{customdata[{i}]{fmt}}}"
+        for i, (_, label, fmt) in enumerate(fields)
+    ]
+    return "<br>".join(lines) + "<extra></extra>"
+
+
+def _profit_leg_settles_in(agg: pd.DataFrame) -> pd.Series:
+    """Settle-time of the leg paying us the most this epoch.
+
+    Per-leg payment-to-us magnitude:
+      * short leg pays us +short_apy when short_apy > 0 (else 0)
+      * long  leg pays us −long_apy when long_apy < 0 (else 0)
+    Pick the leg with the bigger magnitude. By construction
+    short_apy ≥ long_apy (agg is sorted desc by ΔAPY), so net is positive
+    and at least one leg is always paying — the rule never picks a "cost"
+    leg by mistake.
+
+    Tie (e.g., short_apy = −long_apy exactly): defaults to short. Doesn't
+    happen at meaningful precision in practice.
+    """
+    short_pay = agg["short_apy_pct"].clip(lower=0)
+    long_pay = (-agg["long_apy_pct"]).clip(lower=0)
+    return agg["short_settles_in"].where(short_pay >= long_pay, agg["long_settles_in"])
+
+
+def _render_spreads_scatter(agg: pd.DataFrame) -> None:
+    """4D scatter over the spreads-tab agg. See module-level dimension
+    notes above for the why-of-each-axis."""
+    dims = _SPREAD_SCATTER_DIMS
+    plot = agg.dropna(subset=[dims["x"], dims["y"]])
+    if plot.empty:
+        st.info("No points to plot — entry basis or ΔAPY missing on every row.")
+        return
+
+    # log1p volume for the marker-area encoding. 24h volume spans 3+ orders
+    # of magnitude; linear sizing makes whales dominate and small caps
+    # invisible. log1p compresses the range while keeping zero-volume
+    # rows valid (rare; mostly XT.COM-on-XT-only base_coins where vol may
+    # be unreported on a leg).
+    size_raw = plot[dims["size"]].clip(lower=0).fillna(0)
+    size_log = np.log1p(size_raw)
+    sizeref = (
+        (2.0 * float(size_log.max()) / (35**2)) if size_log.max() > 0 else 1.0
+    )
+
+    customdata = plot[[col for col, _, _ in _SPREAD_HOVER_FIELDS]].to_numpy()
+
+    fig = go.Figure(
+        go.Scatter(
+            x=plot[dims["x"]],
+            y=plot[dims["y"]],
+            mode="markers",
+            marker=dict(
+                size=size_log,
+                sizemode="area",
+                sizeref=sizeref,
+                sizemin=4,
+                color=plot[dims["color"]],
+                # Reversed so imminent (low minutes) renders bright/yellow,
+                # distant renders dark — yellow pops as "paying soon".
+                colorscale="Viridis_r",
+                colorbar=dict(title="Profit leg<br>settles (m)"),
+                line=dict(width=0.5, color="rgba(0,0,0,0.3)"),
+            ),
+            customdata=customdata,
+            hovertemplate=_hover_template(_SPREAD_HOVER_FIELDS),
+        )
+    )
+    # zeroline on x highlights the credit/cost boundary at no extra ink.
+    fig.update_xaxes(
+        title_text="Entry basis bps  (→ credit, ← cost)",
+        zeroline=True,
+        zerolinewidth=1,
+    )
+    fig.update_yaxes(title_text="ΔAPY %")
+    fig.update_layout(
+        height=520,
+        hovermode="closest",
+        margin=dict(l=40, r=20, t=20, b=40),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
 @st.fragment(run_every=30)
 def render_spreads():
     # See render_anomalies for the rationale behind keeping filters inside
@@ -483,7 +619,6 @@ def render_spreads():
 
     st.markdown("##### Filters")
     _filter_inputs("spread", snapshot, include_min_venues=True)
-    st.markdown("##### Symbols ranked by cross-venue ΔAPY")
 
     snapshot = _add_countdown(snapshot, _now_ms())
 
@@ -550,8 +685,18 @@ def render_spreads():
     # Entry basis bps — engine-convention (basis = received − paid). Coalesce
     # to last_price for venues that don't expose mark (BITMART/HTX/OKX per
     # FIELD_NOTES); NaN propagates if both are missing on either leg.
-    short_p = short_rows["mark_price"].fillna(short_rows["last_price"]).values
-    long_p = long_rows["mark_price"].fillna(long_rows["last_price"]).values
+    #
+    # Each leg's price is divided by its base_multiplier first to bring
+    # both legs to per-1×-unit. The same underlying coin is listed under
+    # different prefix multipliers across venues (`CHEEMS` / `1000CHEEMS`
+    # / `1MCHEEMS` / `1000000CHEEMS`); without this normalization, the
+    # raw subtraction is meaningless when legs differ in multiplier.
+    # NULL multiplier (pre-fix rows or unrecognized prefix) propagates to
+    # NaN basis — visible signal rather than silent corruption.
+    short_mult = short_rows["base_multiplier"].astype(float).values
+    long_mult = long_rows["base_multiplier"].astype(float).values
+    short_p = short_rows["mark_price"].fillna(short_rows["last_price"]).values / short_mult
+    long_p = long_rows["mark_price"].fillna(long_rows["last_price"]).values / long_mult
     mid = (short_p + long_p) / 2
     agg["entry_basis_bps"] = (short_p - long_p) / mid * 10000
 
@@ -559,6 +704,23 @@ def render_spreads():
     agg["delta_apy_pct"] = agg["short_apy_pct"] - agg["long_apy_pct"]
     agg = agg.sort_values("delta_apy_pct", ascending=False)
 
+    # Decision-relevant projections of per-leg data. New scatter / hover
+    # dimensions get derived here so the chart and any future analyses
+    # (research notebooks, alert logic) read from one named column.
+    agg["min_vol_musd"] = agg[["short_vol_musd", "long_vol_musd"]].min(axis=1)
+    agg["profit_settles_in"] = _profit_leg_settles_in(agg)
+
+    st.markdown("##### Trade-viability scatter")
+    st.caption(
+        "Each point is a base-coin pair. Upper-right = high yield AND credit "
+        "on entry. Size = min(short, long) 24h volume (log-scaled, so cap "
+        "spans don't bury small pairs). Color = profit leg's settlement "
+        "timing — the leg whose APY pays us the most this epoch. Hover for "
+        "full leg detail."
+    )
+    _render_spreads_scatter(agg)
+
+    st.markdown("##### Symbols ranked by cross-venue ΔAPY")
     cols = [
         "base_coin",
         "listings",

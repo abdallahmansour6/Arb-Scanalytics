@@ -86,6 +86,12 @@ SCHEMA = pa.schema(
             "base_coin",
             pa.string(),
         ),  # multiplier-prefix-stripped base for cross-venue grouping
+        # Integer multiplier encoded in the symbol prefix (1000, 1_000_000, …);
+        # 1 when no prefix. Cross-venue price comparisons MUST divide each
+        # leg's mark/index/last by this — a venue listing CHEEMS as
+        # `1000000CHEEMS` reports a price 1e6× another venue's `CHEEMS`,
+        # and unnormalized subtraction yields nonsensical basis_bps.
+        ("base_multiplier", pa.int32()),
         ("funding_rate", pa.float64()),  # (B) upcoming-boundary rate
         ("funding_interval_h", pa.float32()),  # authoritative; NULL if unobtainable
         ("predicted_rate", pa.float64()),  # (C) cycle-after forecast
@@ -134,15 +140,23 @@ def _canonical_symbol(market: dict) -> str:
     return market["symbol"]
 
 
-# Multiplier-prefix stripper for cross-venue base_coin grouping.
-# Different venues list the same underlying token under different
-# contract-size multipliers — e.g. CHEEMS-the-meme appears on the wire as
-# `CHEEMS` (COINEX/GATE.IO/MEXC), `1000CHEEMS` (BINANCE/BINGX/BITMART/
-# KUCOIN/PHEMEX/XT), `1MCHEEMS` (BITGET), and `1000000CHEEMS` (BYBIT).
-# All four are the same coin; the prefix is purely a display convention
-# for tokens whose 1× spot price is too small to render legibly. Funding
-# rate is a percentage of contract value and is invariant under the
-# multiplier, so cross-multiplier spread arithmetic is sound.
+# Multiplier-prefix parser. Different venues list the same underlying
+# token under different contract-size multipliers — e.g. CHEEMS-the-meme
+# appears on the wire as `CHEEMS` (COINEX/GATE.IO/MEXC), `1000CHEEMS`
+# (BINANCE/BINGX/BITMART/KUCOIN/PHEMEX/XT), `1MCHEEMS` (BITGET), and
+# `1000000CHEEMS` (BYBIT). All four are the same underlying; the prefix
+# is purely a display convention for tokens whose 1× spot price is too
+# small to render legibly.
+#
+# Two derived fields come from the same parse:
+#   * `base_coin` (prefix stripped) — cross-venue grouping key. Funding
+#     rate is a percentage of contract value and is multiplier-invariant,
+#     so cross-multiplier ΔAPY math is sound on this key alone.
+#   * `base_multiplier` (prefix as integer; 1 when none) — the unit of
+#     the venue's price columns (mark/index/last). Anything comparing
+#     prices across venues MUST divide by this first; without it,
+#     `1000000CHEEMS@$0.63` looks 1e6× apart from `CHEEMS@$6.3e-7` when
+#     they're the same per-1× price.
 #
 # The lookahead `(?=[A-Za-z])` is what protects coins like `1INCH`
 # (digits-then-letters with no zero) from being mis-stripped. Verified
@@ -152,10 +166,27 @@ _MULTIPLIER_PREFIX = re.compile(r"^(?:1[KM]|10{2,7})(?=[A-Za-z])", re.IGNORECASE
 
 
 def _base_coin(market: dict) -> str:
-    """Strip multiplier prefix from market.base. Returns base unchanged
-    when no prefix matches. Stored as `base_coin` and used as the
-    cross-venue grouping key in the spreads view."""
+    """Strip the multiplier prefix from market.base. Returns the base
+    unchanged when no prefix matches. Used as the cross-venue grouping
+    key in the spreads view."""
     return _MULTIPLIER_PREFIX.sub("", market.get("base", ""))
+
+
+def _base_multiplier(market: dict) -> int:
+    """Integer multiplier encoded in market.base's prefix; 1 when no
+    prefix. `1K` → 1000, `1M` → 1_000_000, otherwise the literal int
+    (`100`/`1000`/.../`10000000`). Stored alongside `base_coin` so any
+    cross-venue price math can normalize venues to per-1× units."""
+    raw = market.get("base", "")
+    m = _MULTIPLIER_PREFIX.match(raw)
+    if not m:
+        return 1
+    prefix = m.group(0).upper()
+    if prefix == "1K":
+        return 1_000
+    if prefix == "1M":
+        return 1_000_000
+    return int(prefix)
 
 
 def _apy_norm(rate, interval_h):
@@ -183,6 +214,7 @@ def _build_row(
     exchange,
     symbol,
     base_coin,
+    base_multiplier,
     funding_rate,
     interval_h,
     predicted=None,
@@ -210,6 +242,7 @@ def _build_row(
         "exchange": exchange,
         "symbol_canonical": symbol,
         "base_coin": base_coin,
+        "base_multiplier": int(base_multiplier),
         "funding_rate": funding_rate,
         "funding_interval_h": float(interval_h) if interval_h else None,
         "predicted_rate": predicted,
@@ -312,6 +345,7 @@ async def collect_binance(c, ts_ms):
             exchange="BINANCE",
             symbol=_canonical_symbol(market),
             base_coin=_base_coin(market),
+            base_multiplier=_base_multiplier(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=interval_by_sym.get(sym),
             next_ts=_f(f_info.get("nextFundingTime")),
@@ -375,6 +409,7 @@ async def collect_bingx(c, ts_ms):
             exchange="BINGX",
             symbol=_canonical_symbol(market),
             base_coin=_base_coin(market),
+            base_multiplier=_base_multiplier(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=_f(f_info.get("fundingIntervalHours")),
             next_ts=_f(f_info.get("nextFundingTime")),
@@ -437,6 +472,7 @@ async def collect_bitget(c, ts_ms):
                 exchange="BITGET",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(t_info.get("fundingRate")),
                 interval_h=_f(m_info.get("fundInterval")),
                 next_ts=None,  # derived in _build_row
@@ -480,6 +516,7 @@ async def collect_bitmart(c, ts_ms):
                 exchange="BITMART",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(info.get("expected_funding_rate")),
                 interval_h=_f(info.get("funding_interval_hours")),
                 next_ts=_f(info.get("funding_time")),
@@ -520,6 +557,7 @@ async def collect_bybit(c, ts_ms):
                 exchange="BYBIT",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(info.get("fundingRate")),
                 interval_h=_f(info.get("fundingIntervalHour")),
                 next_ts=_f(info.get("nextFundingTime")),
@@ -570,6 +608,7 @@ async def collect_coinex(c, ts_ms):
                 exchange="COINEX",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(f.get("fundingRate")),
                 interval_h=_parse_interval_str(f.get("interval")),
                 next_ts=_f(f.get("fundingTimestamp")),
@@ -624,6 +663,7 @@ async def collect_gate(c, ts_ms):
                 exchange="GATE.IO",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(f.get("fundingRate")),
                 interval_h=_parse_interval_str(f.get("interval")),
                 next_ts=_f(f.get("fundingTimestamp")),
@@ -674,6 +714,7 @@ async def collect_htx(c, ts_ms):
                 exchange="HTX",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(f.get("fundingRate")),
                 interval_h=_f(m_info.get("settlement_period")),
                 next_ts=_f(f_info.get("next_funding_time")),
@@ -731,6 +772,7 @@ async def collect_kucoin(c, ts_ms):
                 exchange="KUCOIN",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(info.get("fundingFeeRate")),
                 interval_h=interval_h,
                 next_ts=_f(info.get("nextFundingRateDateTime")),
@@ -803,6 +845,7 @@ async def collect_mexc(c, ts_ms):
                 exchange="MEXC",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(native.get("fundingRate")),
                 interval_h=_f(native.get("collectCycle")),
                 next_ts=_f(native.get("nextSettleTime")),
@@ -861,6 +904,7 @@ async def collect_okx(c, ts_ms):
                 exchange="OKX",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(f.get("fundingRate")),
                 interval_h=_parse_interval_str(f.get("interval")),
                 next_ts=_f(f.get("fundingTimestamp")),
@@ -910,6 +954,7 @@ async def collect_phemex(c, ts_ms):
                 exchange="PHEMEX",
                 symbol=_canonical_symbol(market),
                 base_coin=_base_coin(market),
+                base_multiplier=_base_multiplier(market),
                 funding_rate=_f(info.get("fundingRateRr")),
                 interval_h=interval_h,
                 next_ts=None,  # derived in _build_row
@@ -967,6 +1012,7 @@ async def collect_xt(c, ts_ms):
             exchange="XT.COM",
             symbol=_canonical_symbol(market),
             base_coin=_base_coin(market),
+            base_multiplier=_base_multiplier(market),
             funding_rate=_f(f.get("fundingRate")),
             interval_h=_f(f_info.get("collectionInternal")),
             next_ts=_f(f_info.get("nextCollectionTime")),

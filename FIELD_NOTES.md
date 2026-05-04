@@ -74,11 +74,42 @@ The execution engine uses real-time L2 VWAP, not these fields. These
 columns are for **scanner-level estimation** of basis-bps cost going
 into the trade-viability calc:
 
-  `basis_bps_estimate = (price_short - price_long) / mid_price * 10000`
+  `basis_bps_estimate = (price_short / mult_short - price_long / mult_long) / mid * 10000`
 
-with prices = `coalesce(mark_price, last_price)` per leg. If the result
+with prices = `coalesce(mark_price, last_price)` per leg, divided by
+that leg's `base_multiplier` (see next section for why). If the result
 is at the edge of viability, fire the engine to get a real-time L2 read
 before committing.
+
+---
+
+## `base_coin` and `base_multiplier` — multiplier-prefix normalization
+
+Different venues list the same underlying token under different
+contract-size multipliers — e.g. CHEEMS-the-meme appears on the wire as
+`CHEEMS` (COINEX/GATE.IO/MEXC), `1000CHEEMS` (BINANCE/BINGX/BITMART/
+KUCOIN/PHEMEX/XT.COM), `1MCHEEMS` (BITGET), `1000000CHEEMS` (BYBIT). All
+four are the same underlying; the prefix is purely a display convention
+for tokens whose 1× spot price is too small to render legibly. Two
+schema columns capture the same parse:
+
+- **`base_coin`** — prefix-stripped base, used as the cross-venue
+  grouping key (the spreads view groups by this). Funding rate is a
+  percentage of contract value and is multiplier-invariant, so cross-
+  multiplier ΔAPY math on `base_coin` is sound.
+- **`base_multiplier`** — integer multiplier encoded in the prefix; 1
+  when no prefix. `1K` → 1000, `1M` → 1_000_000, otherwise the literal
+  int (`100` / `1000` / `10000` / `100000` / `1000000` / `10000000`).
+  **Anything that compares prices across venues MUST divide by this
+  first.** Mark/index/last are stored in the venue's raw prefix-units —
+  `1000000CHEEMS@$0.63` and `CHEEMS@$6.3e-7` are the same per-1× price
+  but raw subtraction reports a 1e6× gap. Volume and OI columns are
+  already USD-denominated, so they're unaffected.
+
+The lookahead `(?=[A-Za-z])` in the prefix regex protects coins like
+`1INCH` (digits-then-letters with no zero) from being mis-stripped —
+verified safe against `1INCH` / `BTC` / `ETH`. Strips: `100`, `1000`,
+`10000`, `100000`, `1000000`, `10000000`, `1K`, `1M` (case-insensitive).
 
 ---
 
