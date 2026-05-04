@@ -270,30 +270,38 @@ def _column_config(extra: dict | None = None) -> dict:
 
 
 def _filter_inputs(
-    prefix: str, snapshot: pd.DataFrame, *, include_min_venues: bool = False
+    prefix: str, snapshot: pd.DataFrame, *, include_spread_filters: bool = False
 ) -> None:
-    """Render filter widgets in semantic, bordered groups. Values land in
-    st.session_state under {prefix}_* keys; fragments read them from there.
+    """Render filter widgets in a single row of bordered groups. Values
+    land in st.session_state under {prefix}_* keys; fragments read them
+    from there.
 
-    Outer column weights are sized to expected content widths so that
-    larger-magnitude inputs (volume in $M, decimals) get more pixels than
-    smaller ones (min-venues, 2-digit). Each group is wrapped in a bordered
-    container so the eye groups related controls visually."""
+    Anomalies tab gets snapshot-level filters only (OI rank, volume).
+    Spreads tab additionally renders post-aggregation filters that
+    operate on the cross-venue agg (min venues, min ΔAPY, entry basis
+    range). Per-tab values are isolated by the {prefix} keys — editing a
+    filter in one tab never touches the other.
+
+    Column weights are sized to expected content widths so range-style
+    inputs (two number_inputs side-by-side) get more pixels than single-
+    input filters."""
     # max() guard for the degenerate case where every row is NULL-OI; the
     # number_input bounds would otherwise be invalid (max < min).
     ranked_total = max(1, int(snapshot["oi_rank"].notna().sum()))
     max_vol_musd = float(snapshot["volume_24h_usd"].max() or 0) / 1e6
-    default_oi_max = min(500, ranked_total)
+    default_oi_max = min(6000, ranked_total)
     default_vol_max = float(round(max_vol_musd + 1, 0))
 
-    # Outer weights ≈ relative content widths.
-    if include_min_venues:
-        weights = [2.0, 2.6, 0.9, 0.6]  # OI · Vol · Settle · Min venues
+    # Spreads order: snapshot filters (OI, Vol) → trade-decision filters
+    # (Basis, ΔAPY) → infrastructure filter (Cross-venue, last because the
+    # operator rarely changes it).
+    if include_spread_filters:
+        weights = [2.0, 2.6, 2.0, 0.8, 0.6]
     else:
-        weights = [2.0, 2.6, 0.9]
-    groups = st.columns(weights, gap="small")
+        weights = [2.0, 2.6]
+    cols = st.columns(weights, gap="small")
 
-    with groups[0]:
+    with cols[0]:
         with st.container(border=True):
             st.markdown("**OI rank**")
             sub = st.columns(2, gap="small")
@@ -319,10 +327,10 @@ def _filter_inputs(
                 f"Rank 1 = highest OI · rank {ranked_total:,} = lowest. "
                 "Pairs without OI data (XT.COM, plus per-cycle misses) are "
                 "unranked and pass this filter regardless of the band — they "
-                "get judged by the volume / settlement filters instead."
+                "get judged by the volume filter instead."
             )
 
-    with groups[1]:
+    with cols[1]:
         with st.container(border=True):
             st.markdown("**24h volume ($M)**")
             sub = st.columns(2, gap="small")
@@ -346,29 +354,54 @@ def _filter_inputs(
                 f"Smallest pair in dataset: $0M · " f"largest: ${max_vol_musd:,.0f}M"
             )
 
-    with groups[2]:
+    if not include_spread_filters:
+        return
+
+    with cols[2]:
         with st.container(border=True):
-            st.markdown("**Settlement**")
-            st.number_input(
-                "Within (m, 0 = off)",
-                min_value=0,
-                max_value=720,
-                value=0,
-                step=15,
-                key=f"{prefix}_settles_max",
+            st.markdown("**Entry basis bps**")
+            sub = st.columns(2, gap="small")
+            with sub[0]:
+                st.number_input(
+                    "Min",
+                    value=-1000.0,
+                    step=10.0,
+                    key=f"{prefix}_basis_min",
+                )
+            with sub[1]:
+                st.number_input(
+                    "Max",
+                    value=1000.0,
+                    step=10.0,
+                    key=f"{prefix}_basis_max",
+                )
+            st.caption(
+                "Engine sign convention: + = credit, − = cost on entry. "
+                "Pairs with NaN basis (missing leg prices, or pre-fix data "
+                "with NULL base_multiplier) pass this filter unconditionally."
             )
 
-    if include_min_venues:
-        with groups[3]:
-            with st.container(border=True):
-                st.markdown("**Cross-venue**")
-                st.number_input(
-                    "Min venues",
-                    min_value=2,
-                    max_value=13,
-                    value=2,
-                    key=f"{prefix}_min_venues",
-                )
+    with cols[3]:
+        with st.container(border=True):
+            st.markdown("**Min ΔAPY %**")
+            st.number_input(
+                "≥",
+                value=200.0,
+                step=10.0,
+                key=f"{prefix}_min_delta_apy",
+                help="Drop pairs with ΔAPY below this. 0 = off.",
+            )
+
+    with cols[4]:
+        with st.container(border=True):
+            st.markdown("**Cross-venue**")
+            st.number_input(
+                "Min venues",
+                min_value=2,
+                max_value=13,
+                value=2,
+                key=f"{prefix}_min_venues",
+            )
 
 
 def _apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
@@ -376,13 +409,10 @@ def _apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
     # filter unconditionally so a narrow band can't silently mute venues
     # that don't expose OI. The volume filter still gets its say — that's
     # the safety net for the candidate's actual tradeability.
-    out = df[
+    return df[
         (df["oi_rank"].isna() | df["oi_rank"].between(f["oi_min"], f["oi_max"]))
         & df["volume_24h_usd"].fillna(0).between(f["vol_min_usd"], f["vol_max_usd"])
     ]
-    if f["settles_max"] > 0:
-        out = out[out["settles_in_min"].fillna(1e18) <= f["settles_max"]]
-    return out
 
 
 # --------------------------------------------------------------------------
@@ -436,7 +466,6 @@ def render_anomalies():
         "oi_max": st.session_state.get("anom_oi_max", 500),
         "vol_min_usd": st.session_state.get("anom_vol_min", 0.5) * 1e6,
         "vol_max_usd": st.session_state.get("anom_vol_max", 1e9) * 1e6,
-        "settles_max": st.session_state.get("anom_settles_max", 0),
     }
     # Drop rows without a usable apy_norm — this view ranks by APY, so a
     # row whose APY is NaN (because the venue couldn't supply funding_rate
@@ -584,9 +613,11 @@ def _render_spreads_scatter(agg: pd.DataFrame) -> None:
                 sizeref=sizeref,
                 sizemin=4,
                 color=plot[dims["color"]],
-                # Reversed so imminent (low minutes) renders bright/yellow,
-                # distant renders dark — yellow pops as "paying soon".
-                colorscale="Viridis_r",
+                # Cold→hot semantic: imminent (low minutes) = red ("pay
+                # attention now"), distant = blue ("not soon"). Bluered_r
+                # has both ends saturated without the RdBu white-midpoint
+                # washout that would dim the middle of the range.
+                colorscale="Bluered_r",
                 colorbar=dict(title="Profit leg<br>settles (m)"),
                 line=dict(width=0.5, color="rgba(0,0,0,0.3)"),
             ),
@@ -618,7 +649,7 @@ def render_spreads():
         return
 
     st.markdown("##### Filters")
-    _filter_inputs("spread", snapshot, include_min_venues=True)
+    _filter_inputs("spread", snapshot, include_spread_filters=True)
 
     snapshot = _add_countdown(snapshot, _now_ms())
 
@@ -627,7 +658,6 @@ def render_spreads():
         "oi_max": st.session_state.get("spread_oi_max", 500),
         "vol_min_usd": st.session_state.get("spread_vol_min", 0.5) * 1e6,
         "vol_max_usd": st.session_state.get("spread_vol_max", 1e9) * 1e6,
-        "settles_max": st.session_state.get("spread_settles_max", 0),
     }
     min_venues = st.session_state.get("spread_min_venues", 2)
     # Spreads is an APY-ranking view; drop rows whose apy_norm is NaN (the
@@ -709,6 +739,21 @@ def render_spreads():
     # (research notebooks, alert logic) read from one named column.
     agg["min_vol_musd"] = agg[["short_vol_musd", "long_vol_musd"]].min(axis=1)
     agg["profit_settles_in"] = _profit_leg_settles_in(agg)
+
+    # Spread-level filters (operate on the agg, not the snapshot — that's
+    # why these widgets live in row 2 of the spreads filter bar). Applied
+    # before scatter & table so both views share the same filtered set.
+    # NaN basis bps (missing leg prices) passes the basis filter
+    # unconditionally — same convention as NULL OI rank: a missing-data
+    # row shouldn't get muted by a range it can't satisfy.
+    min_delta_apy = st.session_state.get("spread_min_delta_apy", 200.0)
+    basis_min = st.session_state.get("spread_basis_min", -1000.0)
+    basis_max = st.session_state.get("spread_basis_max", 1000.0)
+    agg = agg[agg["delta_apy_pct"] >= min_delta_apy]
+    agg = agg[
+        agg["entry_basis_bps"].isna()
+        | agg["entry_basis_bps"].between(basis_min, basis_max)
+    ]
 
     st.markdown("##### Trade-viability scatter")
     st.caption(
