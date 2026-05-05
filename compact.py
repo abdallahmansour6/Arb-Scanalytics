@@ -94,6 +94,30 @@ def _partition_path(d: date) -> Path:
     return FUNDING_DIR / f"year={d.year:04d}" / f"month={d.month:02d}" / f"day={d.day:02d}"
 
 
+_HIVE_COLS = ("year", "month", "day")
+
+
+def _read_single(path: Path) -> pa.Table:
+    """Single-file parquet read with hive-partition columns stripped.
+
+    `pq.read_table(path)` runs the full ParquetDataset machinery and
+    auto-injects `year`/`month`/`day` virtual columns from the parent
+    `year=YYYY/month=MM/day=DD/` directories. Type inference for those
+    injected columns is non-deterministic across reads — pyarrow may
+    emit them as int32 in one call and `dictionary<int32>` in another,
+    which breaks `concat_tables` with:
+        Unable to merge: Field year has incompatible types: int32 vs
+        dictionary<values=int32, indices=int32, ordered=0>
+    `ParquetFile.read()` reads only the file's own columns — no path
+    walking, no partition inference. We additionally strip year/month/
+    day if a prior compaction baked them in; the canonical schema
+    (collector.py) carries no such columns, so they belong in the path,
+    not in the parquet file."""
+    t = pq.ParquetFile(path).read()
+    drop = [c for c in _HIVE_COLS if c in t.schema.names]
+    return t.drop_columns(drop) if drop else t
+
+
 def _atomic_compact(
     target: Path, sources: list[Path], venue: str, dry_run: bool
 ) -> dict:
@@ -120,7 +144,7 @@ def _atomic_compact(
 
     temp = target.with_suffix(target.suffix + ".tmp")
     try:
-        tables = [pq.read_table(s) for s in sources]
+        tables = [_read_single(s) for s in sources]
         # promote_options="default" tolerates additive schema changes
         # mid-window (e.g., a new column was added). Older rows get NULL.
         combined = pa.concat_tables(tables, promote_options="default")
