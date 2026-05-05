@@ -222,7 +222,9 @@ def _column_config(extra: dict | None = None) -> dict:
             "in any multiplier variant. "
             "Filter-independent — does NOT change "
             "when you tweak the OI / volume / "
-            "settlement filters.",
+            "settlement filters OR the venues-in-scope "
+            "selection. So a base_coin can show 8 "
+            "listings even when only 2 are in scope.",
         ),
         # Per-leg columns (Spreads tab) — these refer to the exact two
         # venues you would actually trade against (short = APY-high,
@@ -401,6 +403,13 @@ def _filter_inputs(
                 max_value=13,
                 value=2,
                 key=f"{prefix}_min_venues",
+                help=(
+                    "Minimum number of in-scope venues (passing the "
+                    "OI / volume / basis filters above) that must list "
+                    "this base_coin for it to appear. Reducing the "
+                    "venues-in-scope multiselect shrinks this count "
+                    "for every pair."
+                ),
             )
 
 
@@ -413,6 +422,58 @@ def _apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
         (df["oi_rank"].isna() | df["oi_rank"].between(f["oi_min"], f["oi_max"]))
         & df["volume_24h_usd"].fillna(0).between(f["vol_min_usd"], f["vol_max_usd"])
     ]
+
+
+def _venue_scope_input(prefix: str, snapshot: pd.DataFrame) -> list[str]:
+    """Universe-scope multiselect — semantically distinct from the row-level
+    filters in `_filter_inputs()`. Defines which venues this tab's analytics
+    even *consider*; applied BEFORE per-row filters and (critically, on
+    Spreads) BEFORE the base_coin groupby that picks each pair's short/long
+    legs.
+
+    Why before-groupby on Spreads: idxmax/idxmin pick from `base`, so a
+    venue dropped here is also dropped from leg-pair selection — which is
+    the point. Doing this post-groupby would let idxmax/idxmin pick an
+    excluded venue and then hide the entire row, silently dropping spreads
+    where two of your in-scope venues had a usable ΔAPY for the same
+    base_coin.
+
+    State persists via `{prefix}_venues` session_state, paralleling the
+    existing `{prefix}_*` per-tab keys. Default = every venue observed in
+    the current snapshot, so the list auto-grows when the collector picks
+    up a new venue. Stale entries (a venue that dropped out of the
+    snapshot since last render) are pruned defensively to avoid Streamlit
+    crashing the multiselect with 'Default value is not in the options'."""
+    venues_avail = sorted(snapshot["exchange"].dropna().unique())
+    key = f"{prefix}_venues"
+    if key in st.session_state:
+        st.session_state[key] = [
+            v for v in st.session_state[key] if v in venues_avail
+        ]
+
+    st.markdown("##### Venues in scope")
+    chosen = st.multiselect(
+        "Venues",
+        venues_avail,
+        default=venues_avail,
+        key=key,
+        label_visibility="collapsed",
+        help=(
+            "Universe scope, applied BEFORE the row filters below. On "
+            "the Spreads tab this also runs BEFORE the base_coin "
+            "groupby — so each pair's short/long legs are picked from "
+            "the venues you keep here, not globally with hide-after. "
+            "The 'Listings' column still reports the global venue "
+            "count (unchanged by this selection)."
+        ),
+    )
+    st.caption(
+        f"{len(chosen)}/{len(venues_avail)} venues in scope. Excluded "
+        "venues are dropped from the snapshot before any analytics on "
+        "this tab — including, on Spreads, the short/long leg-pair "
+        "selection."
+    )
+    return chosen
 
 
 # --------------------------------------------------------------------------
@@ -455,6 +516,7 @@ def render_anomalies():
     if snapshot.empty:
         return
 
+    scope = _venue_scope_input("anom", snapshot)
     st.markdown("##### Filters")
     _filter_inputs("anom", snapshot)
     st.markdown("##### Top anomalies by |APY|")
@@ -470,7 +532,11 @@ def render_anomalies():
     # Drop rows without a usable apy_norm — this view ranks by APY, so a
     # row whose APY is NaN (because the venue couldn't supply funding_rate
     # or interval_h for that symbol this cycle) has nothing to contribute.
+    # Scope is just another row filter on this tab (no groupby downstream),
+    # so order vs the OI/volume filters is irrelevant. Order DOES matter on
+    # Spreads — see render_spreads for the asymmetry.
     df = _apply_filters(snapshot, f).dropna(subset=["apy_norm"]).copy()
+    df = df[df["exchange"].isin(scope)]
     df["apy_pct"] = df["apy_norm"] * 100
     df["vol_musd"] = df["volume_24h_usd"] / 1e6
     df["oi_musd"] = df["open_interest_usd"] / 1e6
@@ -648,6 +714,7 @@ def render_spreads():
     if snapshot.empty:
         return
 
+    scope = _venue_scope_input("spread", snapshot)
     st.markdown("##### Filters")
     _filter_inputs("spread", snapshot, include_spread_filters=True)
 
@@ -666,6 +733,14 @@ def render_spreads():
     # idxmax/idxmin when a symbol's only matching venues are all-NaN.
     base = _apply_filters(snapshot, f).dropna(subset=["apy_norm"])
 
+    # Apply the venue scope BEFORE the base_coin groupby below. The
+    # idxmax/idxmin pick legs from `base`, so any venue dropped here is
+    # also dropped from leg-pair selection — which is the point. Doing
+    # this post-groupby would let idxmax/idxmin pick an excluded venue
+    # and then hide the entire row, silently dropping spreads where two
+    # of your in-scope venues had a usable ΔAPY for the same base_coin.
+    base = base[base["exchange"].isin(scope)]
+
     if base.empty:
         st.info("No symbols match filters.")
         return
@@ -677,6 +752,11 @@ def render_spreads():
     # percentage of contract value, so cross-multiplier ΔAPY is sound.
     # Each leg row still surfaces its actual `symbol_canonical` so the
     # trade routes to the correct venue-specific contract.
+    #
+    # `listings` is computed from the *unfiltered* snapshot — so it stays
+    # both row-filter-independent AND scope-independent: a base_coin can
+    # show 'listings = 8' even when only 2 of those 8 are in scope. See
+    # _column_config() for the user-visible help text.
     listings = snapshot.groupby("base_coin")["exchange"].nunique()
 
     # idx_high / idx_low identify the venue at high/low APY for each
