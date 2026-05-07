@@ -21,6 +21,8 @@ fake fallback.
 Failure of any single venue is isolated and logged; sibling venues
 continue. Run with --once for a single cycle (test-drive); without
 flags, loops until SIGTERM/SIGINT.
+
+ANY CHANGES TO CEX PARSING OR ROUTING MUST BE REFLECTED IN FIELD_NOTES.MD
 """
 
 import argparse
